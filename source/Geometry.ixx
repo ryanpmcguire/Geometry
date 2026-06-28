@@ -8,7 +8,6 @@ module;
 #include <cstdio>
 #include <cstdlib>
 #include <random>
-#include <functional>
 #include <cmath>
 #include <algorithm>
 
@@ -243,7 +242,7 @@ export namespace Geo {
     // The concrete stoicheion types, as an enum: the cheap, string-free type
     // probe (kind() remains only as the serialisation tag).
     enum class SKind : std::uint8_t {
-        Point, Segment, Circle, Arc, Ellipse, EllipseArc, OffsetEllipse
+        Point, Segment, Circle, Arc, Ellipse, EllipseArc, OffsetEllipse, Spline
     };
 
     // The display / category group of a stoicheion in generated (offset) layers:
@@ -264,8 +263,6 @@ export namespace Geo {
     // ===============================================================
     // Stoicheion (στοιχεῖον) -- the fundamental geometric element.
     //
-    struct MotionField;   // the solver's working buffer (defined below)
-
     // Euclid's "Elements" is the Stoicheia; a single primitive is a Stoicheion.
     // Each concrete type stores its own data and knows how to: serialise itself,
     // draw itself as a polyline (tessellate), measure distance to a probe point,
@@ -369,13 +366,6 @@ export namespace Geo {
         // Mutable control points -- every absolute point defining the entity (used
         // both for moving and for coincidence detection between entities).
         virtual void controlPoints(std::vector<Pos2*>& out) = 0;
-
-        // Inherent invariants: the unbreakable relations *among an entity's own
-        // points* (an arc's endpoints share the centre's radius, ...). The solver
-        // runs this each pass so a control point can never drift off the shape it
-        // defines. `id` is this entity's id, so it can name its own points; default:
-        // a shape with no internal coupling (point, segment) does nothing.
-        virtual void relaxInherent(MotionField& field, Id id, float rate) const {}
 
         // Offsetting. `offset` moves this curve sideways by `amount`, *in place*:
         // positive grows / outsets, negative insets (toward the curve's interior --
@@ -721,10 +711,6 @@ export namespace Geo {
             out.push_back(&c); out.push_back(&a); out.push_back(&b); out.push_back(&d);
         }
 
-        // Endpoints a and b must stay equidistant from centre c (both on the circle).
-        // Defined out of line, once MotionField is complete.
-        void relaxInherent(MotionField& field, Id id, float rate) const override;
-
         // Concentric offset, chirality-aware. The chirality is the travel direction
         // A -> B through D: CCW (+1) behaves like a CCW boundary, so a negative amount
         // shrinks it; CW (-1) reverses the sense, so the same amount grows it. Driving
@@ -1015,6 +1001,198 @@ export namespace Geo {
         }
     };
 
+    // Spline -- a (possibly offset) NURBS / B-spline curve, the catch-all for every
+    // freeform edge OpenCASCADE hands back from a planar BRep section (torus and
+    // freeform-surface sections, and conics when the section is approximated). Like
+    // OffsetEllipse2 it is a parametric curve handled entirely NUMERICALLY, and it
+    // carries the same offset trick: the true offset of a spline is not a spline, so
+    // it is represented as base curve + signed distance `d`, evaluated as
+    // base(u) + d * (left normal). The family is closed under offsetting -- offsetting
+    // by delta just changes d -- exactly as for OffsetEllipse2.
+    //
+    // The base curve is its OWN control points / knots / weights (no OpenCASCADE
+    // handle): Geo.Geometry stays OCC-free, and the De Boor evaluator below is the
+    // whole dependency. Travel runs a0 -> a1 in the base KNOT parameter, either
+    // direction -- so reversal is swapping a0/a1 and splitting is interval arithmetic
+    // on [a0,a1], both leaving the control net untouched. A non-rational spline omits
+    // weights (treated as all 1); a rational one (OCC's exact conics) carries them.
+    struct Spline2 : public Stoicheion {
+
+        std::vector<Pos2>  ctrl;           // control points
+        std::vector<float> knots;          // flat knot vector (size = ctrl.size() + degree + 1)
+        std::vector<float> weights;        // rational weights (empty => non-rational); size = ctrl.size()
+        int   degree = 3;
+        float d  = 0.0f;                   // outward offset distance (signed)
+        float a0 = 0.0f, a1 = 0.0f;        // travel: base parameter a0 -> a1
+
+        Spline2() = default;
+        Spline2(std::vector<Pos2> ctrl, std::vector<float> knots, std::vector<float> weights, int degree)
+            : ctrl(std::move(ctrl)), knots(std::move(knots)), weights(std::move(weights)), degree(degree) {
+            a0 = domainMin(); a1 = domainMax();
+        }
+        Spline2(std::vector<Pos2> ctrl, std::vector<float> knots, std::vector<float> weights,
+                int degree, float d, float a0, float a1)
+            : ctrl(std::move(ctrl)), knots(std::move(knots)), weights(std::move(weights)),
+              degree(degree), d(d), a0(a0), a1(a1) {}
+
+        // The clamped-knot domain [knots[degree], knots[numCtrl]] the curve is defined over.
+        float domainMin() const { return (static_cast<int>(knots.size()) > degree) ? knots[degree] : 0.0f; }
+        float domainMax() const {
+            const int n = static_cast<int>(ctrl.size());
+            return (static_cast<int>(knots.size()) > n) ? knots[n] : 1.0f;
+        }
+
+        // The knot span k with knots[k] <= u < knots[k+1], clamped to [degree, numCtrl-1]
+        // (Piegl & Tiller, "The NURBS Book").
+        int findSpan(float u) const {
+            const int n = static_cast<int>(ctrl.size()) - 1;
+            if (u >= knots[n + 1]) { return n; }
+            if (u <= knots[degree]) { return degree; }
+            int low = degree, high = n + 1, mid = (low + high) / 2;
+            while (u < knots[mid] || u >= knots[mid + 1]) {
+                if (u < knots[mid]) { high = mid; } else { low = mid; }
+                mid = (low + high) / 2;
+            }
+            return mid;
+        }
+
+        // De Boor evaluation of the BASE (un-offset) curve at knot parameter u. Works
+        // in homogeneous coordinates so rational (NURBS) curves evaluate exactly.
+        Pos basePointAt(float u) const {
+            const int n = static_cast<int>(ctrl.size());
+            if (n == 0) { return Pos(); }
+            if (n == 1) { return ctrl[0]; }
+            const int p = degree;
+            if (p < 1 || p > 24 || static_cast<int>(knots.size()) < n + p + 1) { return ctrl[0]; }
+            u = std::clamp(u, knots[p], knots[n]);
+            const int k = findSpan(u);
+            const bool rational = (weights.size() == ctrl.size());
+            float dx[26], dy[26], dw[26];
+            for (int j = 0; j <= p; j++) {
+                const int idx = k - p + j;
+                const float w = rational ? weights[idx] : 1.0f;
+                dx[j] = ctrl[idx].x * w; dy[j] = ctrl[idx].y * w; dw[j] = w;
+            }
+            for (int r = 1; r <= p; r++) {
+                for (int j = p; j >= r; j--) {
+                    const int idx = k - p + j;
+                    const float left = knots[idx], right = knots[idx + p - r + 1];
+                    const float den = right - left;
+                    const float a = (den > 1e-12f) ? (u - left) / den : 0.0f;
+                    dx[j] = (1.0f - a) * dx[j - 1] + a * dx[j];
+                    dy[j] = (1.0f - a) * dy[j - 1] + a * dy[j];
+                    dw[j] = (1.0f - a) * dw[j - 1] + a * dw[j];
+                }
+            }
+            const float w = dw[p];
+            return (std::fabs(w) > 1e-12f) ? Pos(dx[p] / w, dy[p] / w) : Pos(dx[p], dy[p]);
+        }
+
+        // Unit base tangent by guarded central difference (degrees of the rational
+        // derivative aren't worth carrying; the difference is ample at section scale).
+        Pos baseTangentAt(float u) const {
+            const float lo = domainMin(), hi = domainMax();
+            const float h = std::max(1e-4f, (hi - lo) * 1e-3f);
+            Pos t = basePointAt(std::min(hi, u + h)) - basePointAt(std::max(lo, u - h));
+            float l = t.pythag();
+            return (l > 1e-12f) ? t / l : Pos(1.0f, 0.0f);
+        }
+
+        // The realized (offset) point at base parameter u: base displaced by d along
+        // the left normal of the base tangent (no displacement when d == 0).
+        Pos offsetPointAt(float u) const {
+            Pos base = basePointAt(u);
+            if (std::fabs(d) < 1e-12f) { return base; }
+            Pos t = baseTangentAt(u);
+            return base + Pos(-t.y, t.x) * d;
+        }
+
+        // Normalised travel coordinate s in [0,1] -> base parameter / point / tangent.
+        float paramAt(float s) const { return a0 + (a1 - a0) * s; }
+        Pos   pointAt(float s) const { return offsetPointAt(paramAt(s)); }
+        Pos tangentAt(float s) const {
+            const float h = 1e-3f;
+            Pos t = pointAt(std::min(1.0f, s + h)) - pointAt(std::max(0.0f, s - h));
+            float l = t.pythag();
+            return (l > 1e-12f) ? t / l : Pos(1.0f, 0.0f);
+        }
+
+        // A closed curve whose travel covers the whole domain: no endpoints (like a
+        // full circle / full-span offset ellipse).
+        bool fullLoop() const {
+            if (ctrl.size() < 2) { return false; }
+            const float lo = domainMin(), hi = domainMax();
+            if (std::fabs(std::fabs(a1 - a0) - (hi - lo)) > 1e-4f * std::max(1.0f, hi - lo)) { return false; }
+            return (basePointAt(lo) - basePointAt(hi)).pythag() < 1e-4f;
+        }
+
+        SKind type() const override { return SKind::Spline; }
+        const char* kind() const override { return "spline"; }
+        std::unique_ptr<Stoicheion> clone() const override { return std::make_unique<Spline2>(*this); }
+        Json data() const override {
+            Json cps = Json::array(); for (const Pos2& p : ctrl)    { cps.push_back(p.toJson()); }
+            Json kns = Json::array(); for (float k : knots)         { kns.push_back(k); }
+            Json wts = Json::array(); for (float w : weights)       { wts.push_back(w); }
+            return Json{ { "ctrl", cps }, { "knots", kns }, { "weights", wts },
+                         { "degree", degree }, { "d", d }, { "a0", a0 }, { "a1", a1 } };
+        }
+        void load(const Json& j) override {
+            ctrl.clear(); knots.clear(); weights.clear();
+            if (auto it = j.find("ctrl");    it != j.end() && it->is_array()) { for (const Json& p : *it) { ctrl.push_back(Pos2::fromJson(p)); } }
+            if (auto it = j.find("knots");   it != j.end() && it->is_array()) { for (const Json& k : *it) { knots.push_back(k.get<float>()); } }
+            if (auto it = j.find("weights"); it != j.end() && it->is_array()) { for (const Json& w : *it) { weights.push_back(w.get<float>()); } }
+            degree = j.value("degree", 3);
+            d = j.value("d", 0.0f); a0 = j.value("a0", 0.0f); a1 = j.value("a1", 0.0f);
+        }
+
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override {
+            int steps = sampleSteps();
+            for (int i = skipFirst ? 1 : 0; i <= steps; i++) { out.push_back(pointAt(static_cast<float>(i) / steps)); }
+        }
+        // Quadrature of ∮(x dy - y dx) over the travel span -- the chord shoelace over a
+        // fine sampling of the exact curve (no elementary closed form for a spline's
+        // area integral).
+        float signedAreaTerm() const override {
+            const int N = 256;
+            float sum = 0.0f;
+            Pos prev = pointAt(0.0f);
+            for (int i = 1; i <= N; i++) {
+                Pos p = pointAt(static_cast<float>(i) / N);
+                sum += prev.x * p.y - prev.y * p.x;
+                prev = p;
+            }
+            return sum;
+        }
+        float distanceTo(Pos p) const override { Pos foot; footNearest(p, foot); return (p - foot).pythag(); }
+        void anchors(std::vector<Pos>& out) const override {
+            out.push_back(pointAt(0.0f)); out.push_back(pointAt(1.0f));
+        }
+        bool footOnCurve(Pos p, Pos& out) const override { footNearest(p, out); return true; }
+        void controlPoints(std::vector<Pos2*>& out) override {}   // derived geometry: nothing solvable
+
+        // Stoicheion::offset semantics (+grows): outward is simply more d. The family
+        // is closed under offsetting, so offsetBy()/offsetInto() default forms stay
+        // exact (one Spline2 with a larger d) -- no tessellation needed.
+        void offset(float amount) override { d += amount; }
+
+      protected:
+        // Tessellation density from a coarse arc-length estimate (chord target ~0.25
+        // model units, matching the section sampler); bounded so trims and giants behave.
+        int sampleSteps() const {
+            const int C = 16; float len = 0.0f; Pos prev = pointAt(0.0f);
+            for (int i = 1; i <= C; i++) { Pos p = pointAt(static_cast<float>(i) / C); len += (p - prev).pythag(); prev = p; }
+            return std::clamp(static_cast<int>(std::ceil(len / 0.25f)), 24, 256);
+        }
+        void footNearest(Pos p, Pos& out) const {
+            const int N = 96; float best = 1e30f;
+            for (int i = 0; i <= N; i++) {
+                Pos e = pointAt(static_cast<float>(i) / N);
+                float dist = (p - e).pythag();
+                if (dist < best) { best = dist; out = e; }
+            }
+        }
+    };
+
     // Factory: reconstruct an entity from its JSON envelope.
     //--------------------------------------------------
     inline std::unique_ptr<Stoicheion> stoicheionFromJson(const Json& j) {
@@ -1029,6 +1207,7 @@ export namespace Geo {
         else if (kind == "ellipse")    { e = std::make_unique<Ellipse2>(); }
         else if (kind == "ellipseArc") { e = std::make_unique<EllipseArc2>(); }
         else if (kind == "offsetEllipse") { e = std::make_unique<OffsetEllipse2>(); }
+        else if (kind == "spline")     { e = std::make_unique<Spline2>(); }
         else { return nullptr; }
 
         e->load(j);
@@ -1042,525 +1221,13 @@ export namespace Geo {
         return e;
     }
 
-    // ===============================================================
-    // Relation -- the single concept that ties entities together. There is no
-    // separate "constraint": a dimension is a Distance relation, horizontal/vertical
-    // is a Parallel relation, a lock is a Lock relation. All of them are relations.
-    //
-    // Mirrors the Stoicheion pattern: an overridable base whose concrete types each
-    // store their own data and serialise themselves under a "kind" tag. A relation
-    // references the entities it relates by their stable ids (so it survives edits
-    // and re-ordering). Concrete relation types (coincident, parallel, distance,
-    // tangent, ...) arrive on top of this scaffold.
-    // ===============================================================
-    // A reference to one defining point of an entity: the entity's stable id plus
-    // the slot index into its control points (segment end 0/1, circle centre 0...).
-    // This is how a relation names a point without knowing what kind of entity owns
-    // it. Resolved to a mutable Pos2* through the entity at apply time.
-    struct PointRef {
-        Id entity = 0;
-        int slot = 0;
-
-        bool operator==(const PointRef& o) const { return entity == o.entity && slot == o.slot; }
-
-        Json toJson() const { return Json{ { "e", idToHex(entity) }, { "s", slot } }; }
-        static PointRef fromJson(const Json& j) {
-            return { idFromHex(j.value("e", std::string())), j.value("s", 0) };
-        }
-    };
-
-    // The instantaneous freedom of a point: which displacements it can accept. The
-    // master stroke -- capacity is not binary. A point may be Free (the whole
-    // plane), constrained to a Line (one direction only), or Locked (no motion).
-    // A proposed displacement is *masked* onto the allowed subspace before it is
-    // applied; capacities compose by intersection back along the authority chain.
-    struct Capacity {
-        enum Kind { Free, Line, Locked };
-        Kind kind = Free;
-        Pos dir;                       // unit direction when Line
-
-        static Capacity free()        { return { Free,   Pos() }; }
-        static Capacity locked()      { return { Locked, Pos() }; }
-        static Capacity line(Pos d)   { float l = d.pythag(); return { Line, (l > 1e-9f) ? d / l : Pos() }; }
-
-        // Project a proposed displacement onto the allowed subspace (the signed dot
-        // product picks how far along an allowed line the proposal carries).
-        Pos mask(Pos delta) const {
-            if (kind == Locked) { return Pos(0.0f, 0.0f); }
-            if (kind == Line)   { return dir * delta.dot(dir); }
-            return delta;
-        }
-
-        // Intersect two capacities -- the point must satisfy both.
-        static Capacity combine(Capacity a, Capacity b) {
-            if (a.kind == Locked || b.kind == Locked) { return locked(); }
-            if (a.kind == Free) { return b; }
-            if (b.kind == Free) { return a; }
-            // Both lines: parallel ⇒ the same line; otherwise only the origin ⇒ locked.
-            return (std::fabs(a.dir.cross(b.dir)) < 1e-6f) ? a : locked();
-        }
-    };
-
-    // The working buffer for the interactive relaxation ("annealing") solver. Every
-    // control point becomes a node holding a scratch position and whether it is free
-    // to move. Relations read neighbours' positions and nudge the movable ones toward
-    // satisfaction; pinned nodes (grounded datums, or the points the user is holding)
-    // are the boundary the motion distributes between. This is a soft, position-based
-    // relaxation -- it spreads motion realistically, it does not assert hard rules.
-    // A point the user is holding during a drag, and where they are holding it.
-    struct DragPoint { PointRef ref; Pos target; };
-
-    struct MotionField {
-        struct Node { PointRef ref; Pos pos; bool movable = true; };
-        std::vector<Node> nodes;
-
-        int find(const PointRef& p) const {
-            for (size_t i = 0; i < nodes.size(); i++) { if (nodes[i].ref == p) { return static_cast<int>(i); } }
-            return -1;
-        }
-        Pos pos(const PointRef& p) const { int i = find(p); return (i < 0) ? Pos() : nodes[i].pos; }
-        // Freedom weight: 0 if pinned/absent, else 1. (Friction weighting can refine this.)
-        float freedom(const PointRef& p) const { int i = find(p); return (i < 0 || !nodes[i].movable) ? 0.0f : 1.0f; }
-        // Move a point by a delta -- ignored if the point is pinned.
-        void nudge(const PointRef& p, Pos d) { int i = find(p); if (i >= 0 && nodes[i].movable) { nodes[i].pos = nodes[i].pos + d; } }
-        // Place a point exactly -- ignored if the point is pinned (used by the weld).
-        void set(const PointRef& p, Pos pos) { int i = find(p); if (i >= 0 && nodes[i].movable) { nodes[i].pos = pos; } }
-    };
-
-    // Arc invariant: the two endpoints share the centre's radius. Distributed as a
-    // position-based constraint across whichever of {c, a, b} are free -- so dragging
-    // an endpoint to a coincidence slides the *centre/start* to keep the arc circular
-    // and the endpoint genuinely on the curve (never a free-floating control point).
-    inline void Arc2::relaxInherent(MotionField& field, Id id, float rate) const {
-        PointRef rc{ id, 0 }, ra{ id, 1 }, rb{ id, 2 };
-        Pos C = field.pos(rc), A = field.pos(ra), B = field.pos(rb);
-        float fc = field.freedom(rc), fa = field.freedom(ra), fb = field.freedom(rb);
-        float la = (A - C).pythag(), lb = (B - C).pythag();
-        if (la < 1e-6f || lb < 1e-6f) { return; }
-        Pos ua = (A - C) / la, ub = (B - C) / lb;       // unit radials
-        Pos gc = ub - ua;                               // gradient of (la-lb) w.r.t. C
-        float denom = fa + fb + fc * gc.dot(gc);        // inverse-mass weighted
-        if (denom < 1e-9f) { return; }
-        float lambda = (la - lb) / denom;
-        field.nudge(ra, ua * (-lambda * fa * rate));
-        field.nudge(rb, ub * ( lambda * fb * rate));
-        field.nudge(rc, gc * (-lambda * fc * rate));
-    }
-
-    struct Relation {
-
-        Id id = 0;                   // stable unique identity (assigned on commit)
-
-        virtual ~Relation() = default;
-
-        virtual const char* kind() const = 0;
-        virtual std::unique_ptr<Relation> clone() const = 0;
-        virtual Json data() const = 0;          // type-specific payload
-        virtual void load(const Json& j) = 0;   // read type-specific payload
-
-        // Enforce this relation on the geometry, type-agnostically: the relation
-        // resolves the entities it references by id (via `lookup`) and commands
-        // their points. It never learns what kind of entity it operates on.
-        virtual void apply(const std::function<Stoicheion*(Id)>& lookup) {}
-
-        // Solve-order topology: the point this relation *determines* (its follower)
-        // and the points that determine it (its authorities/masters). Used to rank
-        // relations so they resolve roots-first.
-        virtual PointRef follower() const { return {}; }
-        virtual void masters(std::vector<PointRef>& out) const {}
-
-        // If this relation rigidly ties two points to the same position (a
-        // coincidence), report them -- so a drag can move the whole cluster.
-        virtual bool coincidentPair(PointRef& a, PointRef& b) const { return false; }
-
-        // How this relation restricts the motion capacity of point `p`. `resolveCap`
-        // computes the full capacity of any other point (so a relation can defer to
-        // the authority chain), and `posOf` reads a point's current position (a
-        // distance needs it to find the tangent). Default: no restriction.
-        virtual Capacity capacity(const PointRef& p,
-                                  const std::function<Capacity(const PointRef&)>& resolveCap,
-                                  const std::function<Pos(const PointRef&)>& posOf) const {
-            return Capacity::free();
-        }
-
-        // Soft motion distribution for the interactive solver. Nudge this relation's
-        // movable points a fraction `rate` toward satisfaction, splitting each
-        // correction between its points in proportion to their freedom (the freer
-        // point yields more) so motion spreads rather than snapping. Pinned points
-        // act as anchors. Default: a relation distributes no motion.
-        virtual void relax(MotionField& field, float rate) const {}
-
-        // How badly this relation is currently violated, in world units (0 = exactly
-        // satisfied). Used to detect whether a freshly proposed relation can coexist
-        // with the existing ones or genuinely conflicts. Default: never violated.
-        virtual float residual(const std::function<Pos(const PointRef&)>& posOf) const { return 0.0f; }
-
-        Json toJson() const {
-            Json j = data();
-            j["id"] = idToHex(id);
-            j["kind"] = kind();
-            return j;
-        }
-    };
-
-    // Set point `r`'s position on its entity (resolved via `lookup`); no-op if the
-    // entity or slot is gone. Reading is the const-correct mirror.
-    inline bool readPoint(const std::function<Stoicheion*(Id)>& lookup, const PointRef& r, Pos& out) {
-        Stoicheion* e = lookup(r.entity);
-        if (!e) { return false; }
-        std::vector<Pos2*> cps;
-        e->controlPoints(cps);
-        if (r.slot < 0 || r.slot >= static_cast<int>(cps.size())) { return false; }
-        out = *cps[static_cast<size_t>(r.slot)];
-        return true;
-    }
-    inline bool writePoint(const std::function<Stoicheion*(Id)>& lookup, const PointRef& r, Pos p) {
-        Stoicheion* e = lookup(r.entity);
-        if (!e || e->locked) { return false; }   // datums never move
-        std::vector<Pos2*> cps;
-        e->controlPoints(cps);
-        if (r.slot < 0 || r.slot >= static_cast<int>(cps.size())) { return false; }
-        *cps[static_cast<size_t>(r.slot)] = p;
-        return true;
-    }
-
-    // Coincident: point B is held equal to point A. A is the authority (the master);
-    // B follows. (Symmetric in meaning, directional in resolution -- the order is
-    // the authority order.)
-    struct Coincident : public Relation {
-
-        PointRef a, b;
-
-        Coincident() = default;
-        Coincident(const PointRef& a, const PointRef& b) : a(a), b(b) {}
-
-        const char* kind() const override { return "coincident"; }
-        std::unique_ptr<Relation> clone() const override { return std::make_unique<Coincident>(*this); }
-        Json data() const override { return Json{ { "a", a.toJson() }, { "b", b.toJson() } }; }
-        void load(const Json& j) override {
-            a = PointRef::fromJson(j.value("a", Json::object()));
-            b = PointRef::fromJson(j.value("b", Json::object()));
-        }
-
-        void apply(const std::function<Stoicheion*(Id)>& lookup) override {
-            Pos pa;
-            if (readPoint(lookup, a, pa)) { writePoint(lookup, b, pa); }   // B := A
-        }
-
-        PointRef follower() const override { return b; }
-        void masters(std::vector<PointRef>& out) const override { out.push_back(a); }
-        bool coincidentPair(PointRef& pa, PointRef& pb) const override { pa = a; pb = b; return true; }
-
-        // The slave inherits its master's freedom: it can only go where A can go.
-        Capacity capacity(const PointRef& p,
-                          const std::function<Capacity(const PointRef&)>& resolveCap,
-                          const std::function<Pos(const PointRef&)>& posOf) const override {
-            return (p == b) ? resolveCap(a) : Capacity::free();
-        }
-
-        // Pull A and B together, sharing the closing motion by their freedom.
-        void relax(MotionField& field, float rate) const override {
-            float fa = field.freedom(a), fb = field.freedom(b);
-            if (fa + fb <= 0.0f) { return; }
-            Pos err = field.pos(b) - field.pos(a);          // gap to close
-            field.nudge(a, err * ( (fa / (fa + fb)) * rate));
-            field.nudge(b, err * (-(fb / (fa + fb)) * rate));
-        }
-
-        float residual(const std::function<Pos(const PointRef&)>& posOf) const override {
-            return (posOf(b) - posOf(a)).pythag();
-        }
-    };
-
-    // Lock: a point is pinned in place (it is held at `at`). The fundamental zero-
-    // freedom constraint -- even the origin is locked to mathematical (0,0) by one
-    // of these, rather than being locked by fiat.
-    struct Lock : public Relation {
-
-        PointRef point;
-        Pos2 at;
-
-        Lock() = default;
-        Lock(const PointRef& point, Pos at) : point(point), at(at) {}
-
-        const char* kind() const override { return "lock"; }
-        std::unique_ptr<Relation> clone() const override { return std::make_unique<Lock>(*this); }
-        Json data() const override { return Json{ { "point", point.toJson() }, { "at", at.toJson() } }; }
-        void load(const Json& j) override {
-            point = PointRef::fromJson(j.value("point", Json::object()));
-            at = Pos2::fromJson(j.value("at", Json::object()));
-        }
-
-        void apply(const std::function<Stoicheion*(Id)>& lookup) override {
-            writePoint(lookup, point, at);   // re-assert the locked position
-        }
-
-        PointRef follower() const override { return point; }   // grounded root: no masters
-
-        Capacity capacity(const PointRef& p,
-                          const std::function<Capacity(const PointRef&)>& resolveCap,
-                          const std::function<Pos(const PointRef&)>& posOf) const override {
-            return (p == point) ? Capacity::locked() : Capacity::free();
-        }
-
-        float residual(const std::function<Pos(const PointRef&)>& posOf) const override {
-            return (posOf(point) - at).pythag();
-        }
-    };
-
-    // Distance: the separation |A - B| is held at `d`. B is the authority-follower
-    // (B adjusts to lie at distance d from A along the current direction). This is
-    // the relation behind every "length" and "radius" -- a dimension is a Distance.
-    struct Distance : public Relation {
-
-        PointRef a, b;
-        float d = 0.0f;
-
-        Distance() = default;
-        Distance(const PointRef& a, const PointRef& b, float d) : a(a), b(b), d(d) {}
-
-        const char* kind() const override { return "distance"; }
-        std::unique_ptr<Relation> clone() const override { return std::make_unique<Distance>(*this); }
-        Json data() const override { return Json{ { "a", a.toJson() }, { "b", b.toJson() }, { "d", d } }; }
-        void load(const Json& j) override {
-            a = PointRef::fromJson(j.value("a", Json::object()));
-            b = PointRef::fromJson(j.value("b", Json::object()));
-            d = j.value("d", 0.0f);
-        }
-
-        void apply(const std::function<Stoicheion*(Id)>& lookup) override {
-            Pos pa, pb;
-            if (!readPoint(lookup, a, pa) || !readPoint(lookup, b, pb)) { return; }
-            Pos dir = pb - pa;
-            float len = dir.pythag();
-            Pos nb = (len > 1e-6f) ? (pa + dir / len * d) : (pa + Pos(d, 0.0f));
-            writePoint(lookup, b, nb);   // B re-pinned to distance d from A
-        }
-
-        PointRef follower() const override { return b; }
-        void masters(std::vector<PointRef>& out) const override { out.push_back(a); }
-
-        // If the partner is fixed, the point is confined to a circle of radius d --
-        // its instantaneous freedom is the tangent (perpendicular to the radius). If
-        // the partner is free, the distance imposes no *absolute* restriction.
-        Capacity capacity(const PointRef& p,
-                          const std::function<Capacity(const PointRef&)>& resolveCap,
-                          const std::function<Pos(const PointRef&)>& posOf) const override {
-            PointRef partner;
-            if      (p == a) { partner = b; }
-            else if (p == b) { partner = a; }
-            else             { return Capacity::free(); }
-
-            if (resolveCap(partner).kind != Capacity::Locked) { return Capacity::free(); }
-            Pos radius = posOf(p) - posOf(partner);
-            return Capacity::line(Pos(-radius.y, radius.x));   // tangent to the circle
-        }
-
-        // Restore the length |A-B| = d. The correction runs along the line A->B, so
-        // pulling one point drags the other along that direction -- motion transfers
-        // by the dot product with the connecting direction, shared by freedom.
-        void relax(MotionField& field, float rate) const override {
-            float fa = field.freedom(a), fb = field.freedom(b);
-            if (fa + fb <= 0.0f) { return; }
-            Pos delta = field.pos(b) - field.pos(a);
-            float len = delta.pythag();
-            if (len < 1e-6f) { return; }
-            Pos corr = delta / len * (len - d);             // >0 ⇒ too long: pull together
-            field.nudge(a, corr * ( (fa / (fa + fb)) * rate));
-            field.nudge(b, corr * (-(fb / (fa + fb)) * rate));
-        }
-
-        float residual(const std::function<Pos(const PointRef&)>& posOf) const override {
-            return std::fabs((posOf(b) - posOf(a)).pythag() - d);
-        }
-    };
-
-    // Parallel: the segment A->B runs parallel to a *reference* segment refA->refB.
-    // The direction is not stored -- it is read live from the reference's points, so
-    // the reference genuinely represents the direction in the graph. "Horizontal"
-    // and "vertical" are simply this relation taken against the X and Y axes, whose
-    // endpoints are locked datum points. No angle, no special case. B is projected
-    // onto the line through A along the reference direction.
-    struct Parallel : public Relation {
-
-        PointRef a, b;          // the constrained segment (A anchors, B follows)
-        PointRef refA, refB;    // the reference direction (e.g. an axis' two endpoints)
-
-        Parallel() = default;
-        Parallel(const PointRef& a, const PointRef& b, const PointRef& refA, const PointRef& refB)
-            : a(a), b(b), refA(refA), refB(refB) {}
-
-        const char* kind() const override { return "parallel"; }
-        std::unique_ptr<Relation> clone() const override { return std::make_unique<Parallel>(*this); }
-        Json data() const override {
-            return Json{ { "a", a.toJson() }, { "b", b.toJson() },
-                         { "refA", refA.toJson() }, { "refB", refB.toJson() } };
-        }
-        void load(const Json& j) override {
-            a    = PointRef::fromJson(j.value("a", Json::object()));
-            b    = PointRef::fromJson(j.value("b", Json::object()));
-            refA = PointRef::fromJson(j.value("refA", Json::object()));
-            refB = PointRef::fromJson(j.value("refB", Json::object()));
-        }
-
-        void apply(const std::function<Stoicheion*(Id)>& lookup) override {
-            Pos pa, pb, ra, rb;
-            if (!readPoint(lookup, a, pa) || !readPoint(lookup, b, pb)) { return; }
-            if (!readPoint(lookup, refA, ra) || !readPoint(lookup, refB, rb)) { return; }
-            Pos d = (rb - ra).normalized();
-            if (d.pythag() < 1e-9f) { return; }
-            Pos nb = pa + d * (pb - pa).dot(d);   // B := projection of B onto the line A + t*dir
-            writePoint(lookup, b, nb);
-        }
-
-        PointRef follower() const override { return b; }
-        void masters(std::vector<PointRef>& out) const override {
-            out.push_back(a); out.push_back(refA); out.push_back(refB);
-        }
-
-        // With the partner fixed and the reference direction pinned, the point may
-        // only slide along that direction (the segment must stay parallel).
-        Capacity capacity(const PointRef& p,
-                          const std::function<Capacity(const PointRef&)>& resolveCap,
-                          const std::function<Pos(const PointRef&)>& posOf) const override {
-            PointRef partner;
-            if      (p == a) { partner = b; }
-            else if (p == b) { partner = a; }
-            else             { return Capacity::free(); }
-            if (resolveCap(partner).kind != Capacity::Locked) { return Capacity::free(); }
-            if (resolveCap(refA).kind != Capacity::Locked ||
-                resolveCap(refB).kind != Capacity::Locked) { return Capacity::free(); }   // direction not pinned
-            return Capacity::line((posOf(refB) - posOf(refA)).normalized());
-        }
-
-        // Drive the segment back to parallel by removing the component of (B-A) along
-        // the reference *normal* -- the deviation is the dot product of the segment
-        // with that normal, distributed between A and B by their freedom.
-        void relax(MotionField& field, float rate) const override {
-            Pos d = (field.pos(refB) - field.pos(refA)).normalized();
-            if (d.pythag() < 1e-9f) { return; }
-            Pos n(-d.y, d.x);                               // reference normal
-            float fa = field.freedom(a), fb = field.freedom(b);
-            if (fa + fb <= 0.0f) { return; }
-            float dev = (field.pos(b) - field.pos(a)).dot(n);   // perpendicular error
-            field.nudge(a, n * ( dev * (fa / (fa + fb)) * rate));
-            field.nudge(b, n * (-dev * (fb / (fa + fb)) * rate));
-        }
-
-        float residual(const std::function<Pos(const PointRef&)>& posOf) const override {
-            Pos dir = (posOf(refB) - posOf(refA)).normalized();
-            if (dir.pythag() < 1e-9f) { return 0.0f; }
-            Pos n(-dir.y, dir.x);
-            return std::fabs((posOf(b) - posOf(a)).dot(n));
-        }
-    };
-
-    // Equal: the segment A->B is held the same length as a reference segment
-    // refA->refB. Like Distance, but the length is read live from another segment
-    // (so "equal" tracks the reference). B follows along its current direction.
-    struct Equal : public Relation {
-
-        PointRef a, b;          // the constrained segment (A anchors, B follows)
-        PointRef refA, refB;    // the reference segment whose length is matched
-
-        Equal() = default;
-        Equal(const PointRef& a, const PointRef& b, const PointRef& refA, const PointRef& refB)
-            : a(a), b(b), refA(refA), refB(refB) {}
-
-        const char* kind() const override { return "equal"; }
-        std::unique_ptr<Relation> clone() const override { return std::make_unique<Equal>(*this); }
-        Json data() const override {
-            return Json{ { "a", a.toJson() }, { "b", b.toJson() },
-                         { "refA", refA.toJson() }, { "refB", refB.toJson() } };
-        }
-        void load(const Json& j) override {
-            a    = PointRef::fromJson(j.value("a", Json::object()));
-            b    = PointRef::fromJson(j.value("b", Json::object()));
-            refA = PointRef::fromJson(j.value("refA", Json::object()));
-            refB = PointRef::fromJson(j.value("refB", Json::object()));
-        }
-
-        void apply(const std::function<Stoicheion*(Id)>& lookup) override {
-            Pos pa, pb, ra, rb;
-            if (!readPoint(lookup, a, pa) || !readPoint(lookup, b, pb)) { return; }
-            if (!readPoint(lookup, refA, ra) || !readPoint(lookup, refB, rb)) { return; }
-            float L = (rb - ra).pythag();
-            Pos dir = (pb - pa);
-            float len = dir.pythag();
-            Pos nb = (len > 1e-6f) ? (pa + dir / len * L) : (pa + Pos(L, 0.0f));
-            writePoint(lookup, b, nb);
-        }
-
-        PointRef follower() const override { return b; }
-        void masters(std::vector<PointRef>& out) const override {
-            out.push_back(a); out.push_back(refA); out.push_back(refB);
-        }
-
-        // With its own anchor fixed and the reference length pinned, the point is
-        // confined to a circle of that radius -- its freedom is the tangent.
-        Capacity capacity(const PointRef& p,
-                          const std::function<Capacity(const PointRef&)>& resolveCap,
-                          const std::function<Pos(const PointRef&)>& posOf) const override {
-            PointRef partner;
-            if      (p == a) { partner = b; }
-            else if (p == b) { partner = a; }
-            else             { return Capacity::free(); }
-            if (resolveCap(partner).kind != Capacity::Locked) { return Capacity::free(); }
-            if (resolveCap(refA).kind != Capacity::Locked ||
-                resolveCap(refB).kind != Capacity::Locked) { return Capacity::free(); }   // length not pinned
-            Pos radius = posOf(p) - posOf(partner);
-            return Capacity::line(Pos(-radius.y, radius.x));   // tangent to the circle
-        }
-
-        // Match this segment's length to the reference's current length (read live),
-        // correcting along its own direction like Distance. The reference defines the
-        // length, so it is not adjusted here.
-        void relax(MotionField& field, float rate) const override {
-            float fa = field.freedom(a), fb = field.freedom(b);
-            if (fa + fb <= 0.0f) { return; }
-            float L = (field.pos(refB) - field.pos(refA)).pythag();
-            Pos delta = field.pos(b) - field.pos(a);
-            float len = delta.pythag();
-            if (len < 1e-6f) { return; }
-            Pos corr = delta / len * (len - L);
-            field.nudge(a, corr * ( (fa / (fa + fb)) * rate));
-            field.nudge(b, corr * (-(fb / (fa + fb)) * rate));
-        }
-
-        float residual(const std::function<Pos(const PointRef&)>& posOf) const override {
-            float L = (posOf(refB) - posOf(refA)).pythag();
-            return std::fabs((posOf(b) - posOf(a)).pythag() - L);
-        }
-    };
-
-    // Factory: reconstruct a relation from its JSON envelope (by "kind").
-    inline std::unique_ptr<Relation> relationFromJson(const Json& j) {
-
-        const std::string kind = j.value("kind", std::string());
-        if (kind.empty()) { return nullptr; }
-
-        std::unique_ptr<Relation> r;
-        if      (kind == "coincident") { r = std::make_unique<Coincident>(); }
-        else if (kind == "lock")       { r = std::make_unique<Lock>(); }
-        else if (kind == "distance")   { r = std::make_unique<Distance>(); }
-        else if (kind == "parallel")   { r = std::make_unique<Parallel>(); }
-        else if (kind == "equal")      { r = std::make_unique<Equal>(); }
-
-        if (!r) { return nullptr; }
-
-        r->load(j);
-        r->id = idFromHex(j.value("id", std::string()));
-        if (r->id == 0) { r->id = newId(); }
-        return r;
-    }
-
-    // The full contents of a sketch: the polymorphic list of entities and the
-    // relations between them. Used both as the project's committed geometry and as
-    // a tool's transient preview.
+    // The full contents of a sketch: the polymorphic list of geometry entities.
+    // Constraint relations between entities are intentionally out of scope here --
+    // sketch constraint solving is handled externally; this is purely the entity
+    // document (the committed geometry, or a tool's transient preview).
     struct SketchGeometry {
 
         std::vector<std::unique_ptr<Stoicheion>> entities;
-        std::vector<std::unique_ptr<Relation>>   relations;
 
         SketchGeometry() = default;
         SketchGeometry(SketchGeometry&&) = default;
@@ -1568,8 +1235,8 @@ export namespace Geo {
         SketchGeometry(const SketchGeometry&) = delete;
         SketchGeometry& operator=(const SketchGeometry&) = delete;
 
-        void clear() { entities.clear(); relations.clear(); }
-        bool empty() const { return entities.empty() && relations.empty(); }
+        void clear() { entities.clear(); }
+        bool empty() const { return entities.empty(); }
 
         // Resolve an entity by its stable id (linear for now; a cached id->pointer
         // map comes later).
@@ -1578,304 +1245,11 @@ export namespace Geo {
             return nullptr;
         }
 
-        // Current position of a referenced point (via anchors, which mirror the
-        // control-point order). Empty if the point is gone.
-        Pos posOf(const PointRef& p) const {
-            Stoicheion* e = byId(p.entity);
-            if (!e) { return Pos(); }
-            std::vector<Pos> anc;
-            e->anchors(anc);
-            if (p.slot < 0 || p.slot >= static_cast<int>(anc.size())) { return Pos(); }
-            return anc[static_cast<size_t>(p.slot)];
-        }
-
-        // The datum axis segment representing a world direction: the locked,
-        // two-point entity lying on the X axis (both ys ~ 0) or the Y axis (both xs
-        // ~ 0). Returns 0 if not found. Lets relations reference an axis' endpoints
-        // as their direction representative.
-        Id axisId(bool vertical) const {
-            for (const auto& e : entities) {
-                if (!e || !e->locked) { continue; }
-                std::vector<Pos> anc;
-                e->anchors(anc);
-                if (anc.size() != 2) { continue; }
-                bool match = vertical
-                    ? (std::fabs(anc[0].x) < 1e-3f && std::fabs(anc[1].x) < 1e-3f)
-                    : (std::fabs(anc[0].y) < 1e-3f && std::fabs(anc[1].y) < 1e-3f);
-                if (match) { return e->id; }
-            }
-            return 0;
-        }
-
-        // The authority order (depth from the root) of a point: 0 for a grounded or
-        // free root, otherwise one deeper than the deepest point that determines it.
-        // Loops never form, so this is well-defined (with a defensive cycle guard).
-        int orderOf(const PointRef& p) const {
-            std::vector<PointRef> visiting;
-            return orderImpl(p, visiting);
-        }
-
-        int orderImpl(const PointRef& p, std::vector<PointRef>& visiting) const {
-            for (const PointRef& v : visiting) { if (v == p) { return 0; } }
-            if (Stoicheion* e = byId(p.entity); e && e->locked) { return 0; }
-
-            visiting.push_back(p);
-            int best = -1;
-            std::vector<PointRef> ms;
-            for (const auto& r : relations) {
-                if (!r || !(r->follower() == p)) { continue; }
-                ms.clear();
-                r->masters(ms);
-                for (const PointRef& m : ms) { best = std::max(best, orderImpl(m, visiting)); }
-            }
-            visiting.pop_back();
-            return (best < 0) ? 0 : best + 1;
-        }
-
-        // The prime nodes: the highest-authority point of every independent
-        // authority tree (one per connected component) -- a point that nothing
-        // determines (orderOf == 0), so it grounds (or heads) its tree. These are
-        // the roots the solve starts from. Computed, so it is always accurate as
-        // trees form and merge; not all trees need be connected to each other.
-        std::vector<PointRef> primeNodes() const {
-            std::vector<PointRef> participants;
-            auto add = [&](const PointRef& p) {
-                for (const PointRef& x : participants) { if (x == p) { return; } }
-                participants.push_back(p);
-            };
-            for (const auto& r : relations) {
-                if (!r) { continue; }
-                add(r->follower());
-                std::vector<PointRef> ms;
-                r->masters(ms);
-                for (const PointRef& m : ms) { add(m); }
-            }
-
-            std::vector<PointRef> roots;
-            for (const PointRef& p : participants) {
-                if (orderOf(p) == 0) { roots.push_back(p); }
-            }
-            return roots;
-        }
-
-        // Enforce every relation *symmetrically*. Relations relate, they do not drive:
-        // there is no master->follower order in which one relation gets to reposition a
-        // point and another is skipped as a "loop-closer" (which is what let a Parallel
-        // silently break a Coincident sharing the same vertex). Instead every relation
-        // is a constraint the relaxation solver satisfies together, each pass.
-        //
-        // The only true authorities are the ones whose value comes from *outside* the
-        // system -- Lock (an absolute position) and, via the solver, Distance (a length).
-        // We first re-assert the grounding Locks (their points are absolute), then let
-        // the relaxation settle every relation at once. Points grounded back to a datum
-        // stay put; a free-floating cluster settles into the nearest configuration that
-        // honours all of its relations, moving bodily if nothing pins it.
-        void resolveRelations() {
-            auto lookup = [this](Id id) { return byId(id); };
-            std::vector<PointRef> ms;
-            for (const auto& r : relations) {
-                if (!r) { continue; }
-                ms.clear();
-                r->masters(ms);
-                if (ms.empty()) { r->apply(lookup); }   // grounding (Lock): absolute authority
-            }
-            relaxDrag({}, 200, 1.0f);                    // settle all relations together
-            normalize();                                 // re-seat chirality markers canonically
-        }
-
         // Re-seat every entity's chirality marker (circle b / arc d) to its canonical
-        // spot. The markers ride along with moves but are never solver variables, so
-        // this is run after any settle/drag to keep them at the proper location.
+        // spot. The markers ride along with moves but are never independent points, so
+        // this is run after any bulk edit that may have shifted control points.
         void normalize() {
             for (const auto& e : entities) { if (e) { e->normalize(); } }
-        }
-
-        // The largest violation across all relations, in world units (0 = every
-        // relation exactly satisfied). After a settle, a satisfiable system drives
-        // this near zero; a genuinely over-constrained one leaves it large.
-        float maxResidual() const {
-            auto pos = [this](const PointRef& p) { return posOf(p); };
-            float worst = 0.0f;
-            for (const auto& r : relations) { if (r) { worst = std::max(worst, r->residual(pos)); } }
-            return worst;
-        }
-
-        // A relation can coexist with the existing set if, once everything settles, no
-        // relation is left meaningfully violated (a few thousandths of a unit of slack
-        // for incomplete convergence).
-        static constexpr float ConflictTolerance = 1.0f;
-
-        // Propose a new relation. We add it (it is the most *junior* relation, since
-        // order of creation is seniority) and settle. If the system can satisfy it
-        // along with everything else, it stays. If it conflicts, the senior relations
-        // win and the newcomer is withdrawn -- "the most senior dimension wins." Returns
-        // whether the relation was accepted.
-        bool proposeRelation(std::unique_ptr<Relation> r) {
-            if (r->id == 0) { r->id = newId(); }
-            relations.push_back(std::move(r));
-            resolveRelations();
-            if (maxResidual() <= ConflictTolerance) { return true; }
-            relations.pop_back();                       // junior newcomer loses the conflict
-            resolveRelations();                         // restore the prior configuration
-            return false;
-        }
-
-        // The interactive ("annealing") drag solver. The user holds some points at
-        // target positions; we distribute that motion through the relation graph by
-        // relaxation. Only points grounded to a datum (pointSolved) are truly fixed --
-        // so a *free-floating* cluster, anchored to nothing, moves bodily (even its
-        // own prime root), exactly as it should when nothing pins it in place.
-        //
-        // It is a soft, position-based pass: it spreads motion to the least-solved
-        // points "as if by friction". resolveRelations() drives the same engine with
-        // no held points and more iterations to settle the graph after an edit.
-        void relaxDrag(const std::vector<DragPoint>& held, int iterations = 24, float rate = 0.5f) {
-
-            MotionField field;
-
-            // Every anchor is a node; movable unless grounded to a datum (locked
-            // entity, or solved through the authority chain) -- or unless the anchor
-            // is not a writable control point (an ellipse arc's endpoints are derived
-            // from its parameters, so they can only act as fixed coincidence anchors
-            // until they are made settable; see note in the relax loop).
-            for (const auto& e : entities) {
-                if (!e) { continue; }
-                std::vector<Pos> anc;
-                e->anchors(anc);
-                std::vector<Pos2*> cps;
-                e->controlPoints(cps);
-                for (size_t s = 0; s < anc.size(); s++) {
-                    PointRef pr{ e->id, static_cast<int>(s) };
-                    bool writable = s < cps.size();
-                    bool grounded = e->locked || !writable || pointSolved(pr);
-                    field.nodes.push_back({ pr, anc[s], !grounded });
-                }
-            }
-
-            // The held points become pinned anchors at their target -- but a grounded
-            // point cannot be dragged, so it stays where it is.
-            for (const DragPoint& d : held) {
-                int i = field.find(d.ref);
-                if (i < 0) { continue; }
-                if (field.nodes[i].movable) { field.nodes[i].pos = d.target; }
-                field.nodes[i].movable = false;
-            }
-
-            // Gauss-Seidel relaxation. Each pass: every relation nudges its free
-            // points; every entity re-asserts its own inherent invariants (so an
-            // arc's endpoint can never leave its circle); then coincidence is welded
-            // *exactly*. Ending each pass with the weld means the displayed result
-            // always has rigid endpoint coincidence, with shapes conformed around it.
-            for (int it = 0; it < iterations; it++) {
-                for (const auto& r : relations) { if (r) { r->relax(field, rate); } }
-                for (const auto& e : entities) { if (e) { e->relaxInherent(field, e->id, rate); } }
-                weldCoincidences(field);
-            }
-
-            auto lookup = [this](Id id) { return byId(id); };
-            for (const auto& n : field.nodes) { writePoint(lookup, n.ref, n.pos); }
-        }
-
-        // Strictly enforce coincidence in the working field: every coincidence cluster
-        // is collapsed to a single position. A pinned member (grounded datum / held
-        // point) is the consensus the rest snap onto; with none pinned, the cluster
-        // meets at its average. This is the hard counterpart to the coincidence spring.
-        void weldCoincidences(MotionField& field) const {
-            std::vector<PointRef> done;
-            auto seen = [&](const PointRef& p) {
-                for (const PointRef& d : done) { if (d == p) { return true; } }
-                return false;
-            };
-            for (const auto& r : relations) {
-                if (!r) { continue; }
-                PointRef ca, cb;
-                if (!r->coincidentPair(ca, cb)) { continue; }
-                if (seen(ca)) { continue; }
-
-                std::vector<PointRef> cluster;
-                coincidentClosure(ca, cluster);
-
-                // Consensus: a pinned member's exact position if any, else the average.
-                Pos consensus; bool pinnedFound = false; int count = 0;
-                for (const PointRef& m : cluster) {
-                    int i = field.find(m);
-                    if (i < 0) { continue; }
-                    if (!field.nodes[i].movable) { consensus = field.nodes[i].pos; pinnedFound = true; break; }
-                    consensus = consensus + field.nodes[i].pos; count++;
-                }
-                if (!pinnedFound) {
-                    if (count == 0) { continue; }
-                    consensus = consensus / static_cast<float>(count);
-                }
-                for (const PointRef& m : cluster) { field.set(m, consensus); done.push_back(m); }
-            }
-        }
-
-        // The coincident cluster of a point: every point tied to it (transitively)
-        // by coincidence relations. These must move together under a drag.
-        void coincidentClosure(const PointRef& seed, std::vector<PointRef>& out) const {
-            out.push_back(seed);
-            std::vector<PointRef> stack{ seed };
-            while (!stack.empty()) {
-                PointRef p = stack.back();
-                stack.pop_back();
-                for (const auto& r : relations) {
-                    if (!r) { continue; }
-                    PointRef ca, cb;
-                    if (!r->coincidentPair(ca, cb)) { continue; }
-                    PointRef other;
-                    if      (ca == p) { other = cb; }
-                    else if (cb == p) { other = ca; }
-                    else              { continue; }
-                    bool seen = false;
-                    for (const PointRef& o : out) { if (o == other) { seen = true; break; } }
-                    if (!seen) { out.push_back(other); stack.push_back(other); }
-                }
-            }
-        }
-
-        // The motion capacity of a point: the intersection of every relation's
-        // restriction on it, resolved along the authority chain back to the root.
-        Capacity capacityOf(const PointRef& p) const {
-            std::vector<PointRef> visiting;
-            return capacityImpl(p, visiting);
-        }
-
-        Capacity capacityImpl(const PointRef& p, std::vector<PointRef>& visiting) const {
-            for (const PointRef& v : visiting) { if (v == p) { return Capacity::free(); } }  // cycle guard
-
-            // A datum (origin / axes) is fixed -- its points have no freedom.
-            if (Stoicheion* e = byId(p.entity); e && e->locked) { return Capacity::locked(); }
-
-            visiting.push_back(p);
-            auto resolveCap = [this, &visiting](const PointRef& q) { return capacityImpl(q, visiting); };
-            auto pos        = [this](const PointRef& q) { return posOf(q); };
-            Capacity cap = Capacity::free();
-            for (const auto& r : relations) {
-                if (r) { cap = Capacity::combine(cap, r->capacity(p, resolveCap, pos)); }
-            }
-            visiting.pop_back();
-            return cap;
-        }
-
-        // A point is "solved" (fully constrained / determined) iff it has zero
-        // freedom -- its capacity, grounded through the authority chain, is Locked.
-        bool pointSolved(const PointRef& p) const {
-            return capacityOf(p).kind == Capacity::Locked;
-        }
-
-        // An entity is solved iff every one of its defining points is solved. The
-        // point count comes from anchors() (same order/count as controlPoints()).
-        bool solved(const Stoicheion& e) const {
-            std::vector<Pos> anc;
-            e.anchors(anc);
-            if (anc.empty()) { return false; }
-            int marker = e.chiralitySlot();   // the chirality marker is not a solved point
-            for (size_t s = 0; s < anc.size(); s++) {
-                if (static_cast<int>(s) == marker) { continue; }
-                if (!pointSolved({ e.id, static_cast<int>(s) })) { return false; }
-            }
-            return true;
         }
 
         // Append an entity, assigning it a stable id if it doesn't have one yet.
@@ -1886,18 +1260,10 @@ export namespace Geo {
             return entities.size() - 1;
         }
 
-        size_t addRelation(std::unique_ptr<Relation> r) {
-            if (r->id == 0) { r->id = newId(); }
-            relations.push_back(std::move(r));
-            return relations.size() - 1;
-        }
-
         Json toJson() const {
             Json out;
-            out["entities"]  = Json::array();
-            out["relations"] = Json::array();
-            for (const auto& e : entities)  { if (e) { out["entities"].push_back(e->toJson()); } }
-            for (const auto& r : relations) { if (r) { out["relations"].push_back(r->toJson()); } }
+            out["entities"] = Json::array();
+            for (const auto& e : entities) { if (e) { out["entities"].push_back(e->toJson()); } }
             return out;
         }
 
@@ -1906,11 +1272,6 @@ export namespace Geo {
             if (auto it = j.find("entities"); it != j.end() && it->is_array()) {
                 for (const Json& e : *it) {
                     if (auto ent = stoicheionFromJson(e)) { g.entities.push_back(std::move(ent)); }
-                }
-            }
-            if (auto it = j.find("relations"); it != j.end() && it->is_array()) {
-                for (const Json& e : *it) {
-                    if (auto rel = relationFromJson(e)) { g.relations.push_back(std::move(rel)); }
                 }
             }
             return g;

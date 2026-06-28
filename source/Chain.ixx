@@ -132,10 +132,17 @@ export namespace Geo {
         static bool isArc(const Stoicheion& e)    { return e.type() == SKind::Arc; }
         static bool isCircle(const Stoicheion& e) { return e.type() == SKind::Circle; }
         static bool isOffEll(const Stoicheion& e) { return e.type() == SKind::OffsetEllipse; }
+        static bool isSpline(const Stoicheion& e) { return e.type() == SKind::Spline; }
+        // Parametric: a numerically-handled curve (offset ellipse or spline) carrying
+        // its travel as a base parameter span, offset as a base + signed distance d.
+        // The two share the whole chain interface (pointAt / tangentAt / paramAt /
+        // fullLoop), so the parametric branches below treat them uniformly.
+        static bool isParam(const Stoicheion& e)  { return isOffEll(e) || isSpline(e); }
         static const Segment2* asSeg(const Stoicheion& e)  { return static_cast<const Segment2*>(&e); }
         static const Arc2*     asArc(const Stoicheion& e)  { return static_cast<const Arc2*>(&e); }
         static const Circle2*  asCirc(const Stoicheion& e) { return static_cast<const Circle2*>(&e); }
         static const OffsetEllipse2* asOff(const Stoicheion& e) { return static_cast<const OffsetEllipse2*>(&e); }
+        static const Spline2*  asSpline(const Stoicheion& e) { return static_cast<const Spline2*>(&e); }
 
         // Certified root finding over the normalised span s in [0,1]: a uniform
         // scan brackets every sign change, bisection drives each bracket to
@@ -179,6 +186,25 @@ export namespace Geo {
             }
             return static_cast<float>(0.5 * (lo + hi));
         }
+        // Travel coordinate s in [0,1] of a point on (or near) a spline: coarse scan
+        // for the nearest sample, then ternary refinement (the OffsetEllipse twin).
+        static float splParamOf(const Spline2& sp, Pos p) {
+            const int N = 128;
+            double best = 1e30; double bs = 0.0;
+            for (int i = 0; i <= N; i++) {
+                double s = static_cast<double>(i) / N;
+                double dist = (dPos(sp.pointAt(static_cast<float>(s))) - dPos(p)).len();
+                if (dist < best) { best = dist; bs = s; }
+            }
+            double lo = std::max(0.0, bs - 1.0 / N), hi = std::min(1.0, bs + 1.0 / N);
+            for (int it = 0; it < 50; it++) {
+                double m1 = lo + (hi - lo) / 3.0, m2 = hi - (hi - lo) / 3.0;
+                double d1 = (dPos(sp.pointAt(static_cast<float>(m1))) - dPos(p)).len();
+                double d2 = (dPos(sp.pointAt(static_cast<float>(m2))) - dPos(p)).len();
+                if (d1 < d2) { hi = m2; } else { lo = m1; }
+            }
+            return static_cast<float>(0.5 * (lo + hi));
+        }
         static Segment2* asSeg(Stoicheion& e) { return static_cast<Segment2*>(&e); }
         static Arc2*     asArc(Stoicheion& e) { return static_cast<Arc2*>(&e); }
 
@@ -208,12 +234,14 @@ export namespace Geo {
             if (isArc(e)) { return Pos(asArc(e)->a); }
             if (isCircle(e)) { return Pos(asCirc(e)->a); }   // a closed loop: start == end == a
             if (isOffEll(e)) { return asOff(e)->pointAt(0.0f); }
+            if (isSpline(e)) { return asSpline(e)->pointAt(0.0f); }
             return Pos(asSeg(e)->a);
         }
         static Pos eEnd(const Stoicheion& e) {
             if (isArc(e)) { return Pos(asArc(e)->b); }
             if (isCircle(e)) { return Pos(asCirc(e)->a); }
             if (isOffEll(e)) { return asOff(e)->pointAt(1.0f); }
+            if (isSpline(e)) { return asSpline(e)->pointAt(1.0f); }
             return Pos(asSeg(e)->b);
         }
 
@@ -226,6 +254,7 @@ export namespace Geo {
                 return t.normalized();
             }
             if (isOffEll(e)) { return asOff(e)->tangentAt(0.0f); }
+            if (isSpline(e)) { return asSpline(e)->tangentAt(0.0f); }
             const Segment2* s = asSeg(e);
             return (s->b - s->a).normalized();
         }
@@ -237,6 +266,7 @@ export namespace Geo {
                 return t.normalized();
             }
             if (isOffEll(e)) { return asOff(e)->tangentAt(1.0f); }
+            if (isSpline(e)) { return asSpline(e)->tangentAt(1.0f); }
             const Segment2* s = asSeg(e);
             return (s->b - s->a).normalized();
         }
@@ -250,6 +280,10 @@ export namespace Geo {
             else if (isOffEll(e)) {
                 const OffsetEllipse2* o = asOff(e);   // travel is the parameter order: just swap
                 r = std::make_unique<OffsetEllipse2>(o->c, o->u, o->v, o->d, o->a1, o->a0);
+            }
+            else if (isSpline(e)) {
+                const Spline2* o = asSpline(e);       // travel is the parameter order: just swap
+                r = std::make_unique<Spline2>(o->ctrl, o->knots, o->weights, o->degree, o->d, o->a1, o->a0);
             }
             else {
                 const Segment2* s = asSeg(e);
@@ -307,6 +341,15 @@ export namespace Geo {
                 int s = ((o->u.cross(o->v) >= 0.0f) == (o->a1 >= o->a0)) ? 1 : -1;
                 return std::make_unique<OffsetEllipse2>(o->c, o->u, o->v,
                                                         o->d - d * static_cast<float>(s), o->a0, o->a1);
+            }
+            if (isSpline(e)) {
+                // d is measured to the left of the BASE tangent, so left of TRAVEL is
+                // +d when travelling forward (a1 > a0) and -d when reversed -- the same
+                // closed-under-offset move as the offset ellipse, only the d changes.
+                const Spline2* o = asSpline(e);
+                float s = (o->a1 >= o->a0) ? 1.0f : -1.0f;
+                return std::make_unique<Spline2>(o->ctrl, o->knots, o->weights, o->degree,
+                                                 o->d + d * s, o->a0, o->a1);
             }
             const Segment2* s = asSeg(e);
             Pos dir = s->b - s->a; float L = dir.pythag();
@@ -387,7 +430,7 @@ export namespace Geo {
                 if (r > 1e-9f) { a->a = a->c + (p - a->c).normalized() * r; }
                 return true;
             }
-            if (isCircle(e) || isOffEll(e)) { return false; }
+            if (isCircle(e) || isOffEll(e) || isSpline(e)) { return false; }
             static_cast<Segment2*>(&e)->a = p;
             return true;
         }
@@ -398,7 +441,7 @@ export namespace Geo {
                 if (r > 1e-9f) { a->b = a->c + (p - a->c).normalized() * r; }
                 return true;
             }
-            if (isCircle(e) || isOffEll(e)) { return false; }
+            if (isCircle(e) || isOffEll(e) || isSpline(e)) { return false; }
             static_cast<Segment2*>(&e)->b = p;
             return true;
         }
@@ -432,10 +475,18 @@ export namespace Geo {
                 return result;
             }
 
+            // A lone closed spline likewise: closed, no corners.
+            if (edges.size() == 1 && isSpline(*edges.front()) && asSpline(*edges.front())->fullLoop()) {
+                std::unique_ptr<Stoicheion> o = offsetLeft(*edges.front(), amount);
+                if (pruneSmallFeatures && edgeLength(*o) < PruneLength) { return result; }   // extinct
+                result.edges.push_back(std::move(o));
+                return result;
+            }
+
             // Guard: a chain holding anything we don't offset passes through.
             for (const auto& e : edges) {
                 SKind t = e->type();
-                if (t != SKind::Segment && t != SKind::Arc && t != SKind::OffsetEllipse) {
+                if (t != SKind::Segment && t != SKind::Arc && t != SKind::OffsetEllipse && t != SKind::Spline) {
                     for (const auto& src : edges) { result.edges.push_back(src->clone()); }
                     return result;
                 }
@@ -552,22 +603,32 @@ export namespace Geo {
             return rel * r > 1e-3 && (static_cast<double>(sweep) - rel) * r > 1e-3;
         }
 
-        // Strict-interior test for an offset-ellipse hit (a full loop has no
-        // endpoints to exclude).
-        static bool oeInterior(const OffsetEllipse2& oe, Pos q) {
-            if (oe.fullLoop()) { return true; }
-            return (q - oe.pointAt(0.0f)).pythag() > 1e-3f && (q - oe.pointAt(1.0f)).pythag() > 1e-3f;
+        // A uniform travel sampler for a parametric edge (offset ellipse or spline):
+        // P(s) is the realized point at travel s in [0,1], `full` whether it is a
+        // closed full loop. The two parametric kinds share this whole interface, so
+        // the crossing machinery below treats them with one code path.
+        static bool paramOf(const Stoicheion& e, std::function<Pos(float)>& P, bool& full) {
+            if (isOffEll(e)) { const OffsetEllipse2* o = asOff(e);    P = [o](float s) { return o->pointAt(s); }; full = o->fullLoop(); return true; }
+            if (isSpline(e)) { const Spline2* o = asSpline(e);        P = [o](float s) { return o->pointAt(s); }; full = o->fullLoop(); return true; }
+            return false;
         }
 
-        // Crossings involving an offset ellipse, by certified scan-and-bisect on
-        // its span. Against a line the root function is the signed side; against
-        // a circle, the radial excess; against another offset ellipse, the second
-        // curve is chordised finely and each chord handled as a line (chord
-        // sagitta is far below the method's working tolerance).
-        static void offEllCross(const Stoicheion& A, const Stoicheion& B, std::vector<Pos>& out) {
-            if (!isOffEll(A)) { offEllCross(B, A, out); return; }
-            const OffsetEllipse2& oe = *asOff(A);
-            auto P = [&](double s) { return dPos(oe.pointAt(static_cast<float>(s))); };
+        // Strict-interior test for a parametric hit (a full loop has no endpoints to
+        // exclude).
+        static bool paramInterior(const std::function<Pos(float)>& P, bool full, Pos q) {
+            if (full) { return true; }
+            return (q - P(0.0f)).pythag() > 1e-3f && (q - P(1.0f)).pythag() > 1e-3f;
+        }
+
+        // Crossings involving a parametric edge (offset ellipse or spline), by
+        // certified scan-and-bisect on its travel span. Against a line the root
+        // function is the signed side; against a circle, the radial excess; against
+        // another parametric edge, the second curve is chordised finely and each chord
+        // handled as a line (chord sagitta is far below the method's working tolerance).
+        static void paramCross(const Stoicheion& A, const Stoicheion& B, std::vector<Pos>& out) {
+            std::function<Pos(float)> PA; bool fullA = false;
+            if (!paramOf(A, PA, fullA)) { paramCross(B, A, out); return; }   // make A the parametric one
+            auto P = [&](double s) { return dPos(PA(static_cast<float>(s))); };
 
             auto push = [&](Pos q) {
                 for (const Pos& o : out) { if ((o - q).pythag() < 1e-4f) { return; } }   // dedupe
@@ -581,23 +642,23 @@ export namespace Geo {
                     double u = (q - a).dot(dvec) / len2;
                     if (u < 0.0 || u > 1.0) { continue; }
                     Pos qp = q.f();
-                    if (!oeInterior(oe, qp) || !otherInterior(qp)) { continue; }
+                    if (!paramInterior(PA, fullA, qp) || !otherInterior(qp)) { continue; }
                     push(qp);
                 }
             };
 
-            if (isOffEll(B)) {
-                const OffsetEllipse2& ob = *asOff(B);
+            std::function<Pos(float)> PB; bool fullB = false;
+            if (paramOf(B, PB, fullB)) {
                 const int NB = 96;
-                dPos prev(ob.pointAt(0.0f));
+                dPos prev(PB(0.0f));
                 for (int i = 1; i <= NB; i++) {
-                    dPos cur(ob.pointAt(static_cast<float>(i) / NB));
+                    dPos cur(PB(static_cast<float>(i) / NB));
                     dPos dvec = cur - prev; double len2 = dvec.dot(dvec);
                     if (len2 > 1e-18) {
                         dPos a = prev;
                         std::vector<double> roots;
                         scanRoots([&](double s) { return dvec.cross(P(s) - a); }, 128, roots);
-                        acceptChord(a, dvec, len2, roots, [&](Pos q) { return oeInterior(ob, q); });
+                        acceptChord(a, dvec, len2, roots, [&](Pos q) { return paramInterior(PB, fullB, q); });
                     }
                     prev = cur;
                 }
@@ -610,7 +671,7 @@ export namespace Geo {
                 scanRoots([&](double s) { return (P(s) - dPos(cb)).len() - static_cast<double>(rb); }, 256, roots);
                 for (double s : roots) {
                     Pos q = P(s).f();
-                    if (oeInterior(oe, q) && onSpan(cb, a0b, swb, q)) { push(q); }
+                    if (paramInterior(PA, fullA, q) && onSpan(cb, a0b, swb, q)) { push(q); }
                 }
                 return;
             }
@@ -642,7 +703,7 @@ export namespace Geo {
         // Genuine crossing points of two edges (segments, arcs, full circles or
         // offset ellipses), strictly inside both spans -- transversal only.
         static void edgeCross(const Stoicheion& A, const Stoicheion& B, std::vector<Pos>& out) {
-            if (isOffEll(A) || isOffEll(B)) { offEllCross(A, B, out); return; }
+            if (isParam(A) || isParam(B)) { paramCross(A, B, out); return; }
             Pos ca, cb; float ra, rb, a0a, a0b, swa, swb; int cha, chb;
             bool aa = circularOf(A, ca, ra, a0a, swa, cha);
             bool bb = circularOf(B, cb, rb, a0b, swb, chb);
@@ -725,6 +786,7 @@ export namespace Geo {
                 return static_cast<float>((k->chirality() > 0) ? rel : ((rel > 1e-12) ? 1.0 - rel : 0.0));
             }
             if (isOffEll(e)) { return oeParamOf(*asOff(e), p); }   // already a travel coordinate
+            if (isSpline(e)) { return splParamOf(*asSpline(e), p); }
             dPos s(eStart(e)), d = dPos(eEnd(e)) - dPos(eStart(e));
             double l2 = d.dot(d);
             return (l2 > 1e-18) ? static_cast<float>((dPos(p) - s).dot(d) / l2) : 0.0f;
@@ -757,6 +819,13 @@ export namespace Geo {
                 float tm = o->paramAt(oeParamOf(*o, p));
                 first  = std::make_unique<OffsetEllipse2>(o->c, o->u, o->v, o->d, o->a0, tm);
                 second = std::make_unique<OffsetEllipse2>(o->c, o->u, o->v, o->d, tm, o->a1);
+            }
+            else if (isSpline(e)) {
+                // Pure interval arithmetic on the travel span; the control net is shared.
+                const Spline2* o = asSpline(e);
+                float tm = o->paramAt(splParamOf(*o, p));
+                first  = std::make_unique<Spline2>(o->ctrl, o->knots, o->weights, o->degree, o->d, o->a0, tm);
+                second = std::make_unique<Spline2>(o->ctrl, o->knots, o->weights, o->degree, o->d, tm, o->a1);
             }
             else {
                 const Segment2* seg = asSeg(e);
@@ -818,6 +887,27 @@ export namespace Geo {
                 }
                 return;
             }
+            if (isSpline(e) && asSpline(e)->fullLoop()) {
+                // A closed spline also splits CYCLICALLY (no endpoints): n cuts make a
+                // ring of n parameter intervals, wrapping around -- the control net is
+                // shared by every piece, only the travel span changes.
+                if (points.size() < 2) { out.push_back(e.clone()); return; }
+                const Spline2* o = asSpline(e);
+                std::vector<float> ss;
+                for (const Pos& p : points) { ss.push_back(splParamOf(*o, p)); }
+                std::sort(ss.begin(), ss.end());
+                float total = edgeLength(e);
+                for (size_t i = 0; i < ss.size(); i++) {
+                    float sa = ss[i];
+                    float sb = ss[(i + 1) % ss.size()];
+                    float ds = (i + 1 == ss.size()) ? (sb + 1.0f - sa) : (sb - sa);
+                    if (ds * total < 1e-3f) { continue; }                // coincident cuts
+                    float ta = o->paramAt(sa);
+                    float tb = o->paramAt(sa + ds);                      // may pass the wrap
+                    out.push_back(std::make_unique<Spline2>(o->ctrl, o->knots, o->weights, o->degree, o->d, ta, tb));
+                }
+                return;
+            }
             if (points.empty()) { out.push_back(e.clone()); return; }
             std::vector<std::pair<float, Pos>> sp;
             for (const Pos& p : points) { sp.push_back({ paramOnEdge(e, p), p }); }
@@ -861,12 +951,23 @@ export namespace Geo {
                 }
                 return len;
             }
+            if (isSpline(e)) {
+                const Spline2* o = asSpline(e);
+                const int N = 32; float len = 0.0f;
+                Pos prev = o->pointAt(0.0f);
+                for (int i = 1; i <= N; i++) {
+                    Pos p = o->pointAt(static_cast<float>(i) / N);
+                    len += (p - prev).pythag(); prev = p;
+                }
+                return len;
+            }
             return (eEnd(e) - eStart(e)).pythag();
         }
         static Pos edgeMidpoint(const Stoicheion& e) {
             Pos c; float r, a0, sweep; int chir;
             if (circularOf(e, c, r, a0, sweep, chir)) { return c + Pos::fromAngle(a0 + sweep * 0.5f) * r; }
             if (isOffEll(e)) { return asOff(e)->pointAt(0.5f); }
+            if (isSpline(e)) { return asSpline(e)->pointAt(0.5f); }
             return (eStart(e) + eEnd(e)) * 0.5f;
         }
         // A point a fraction f in [0,1] along an edge's body, IN TRAVEL ORDER:
@@ -880,6 +981,7 @@ export namespace Geo {
                 return c + Pos::fromAngle(start + static_cast<float>(chir) * sweep * f) * r;
             }
             if (isOffEll(e)) { return asOff(e)->pointAt(f); }
+            if (isSpline(e)) { return asSpline(e)->pointAt(f); }
             return eStart(e) + (eEnd(e) - eStart(e)) * f;
         }
 
@@ -899,6 +1001,16 @@ export namespace Geo {
             }
             if (isOffEll(e)) {
                 const OffsetEllipse2* o = asOff(e);
+                Pos best = o->pointAt(0.0f);
+                const int N = 64;
+                for (int i = 1; i <= N; i++) {
+                    Pos p = o->pointAt(static_cast<float>(i) / N);
+                    if (p.x > best.x) { best = p; }
+                }
+                return best;
+            }
+            if (isSpline(e)) {
+                const Spline2* o = asSpline(e);
                 Pos best = o->pointAt(0.0f);
                 const int N = 64;
                 for (int i = 1; i <= N; i++) {
@@ -968,6 +1080,16 @@ export namespace Geo {
                         prev = cur;
                     }
                 }
+                else if (isSpline(*e)) {
+                    const Spline2* o = asSpline(*e);
+                    const int N = 256;
+                    dPos prev(o->pointAt(0.0f));
+                    for (int i = 1; i <= N; i++) {
+                        dPos cur(o->pointAt(static_cast<float>(i) / N));
+                        total += chord(prev, cur);
+                        prev = cur;
+                    }
+                }
                 else {
                     total += chord(dPos(eStart(*e)), dPos(eEnd(*e)));
                 }
@@ -1001,6 +1123,16 @@ export namespace Geo {
                         prev = t;
                     }
                 }
+                else if (isSpline(*e)) {
+                    const Spline2* o = asSpline(*e);
+                    const int N = 64;
+                    dPos prev(o->tangentAt(0.0f));
+                    for (int i = 1; i <= N; i++) {
+                        dPos t(o->tangentAt(static_cast<float>(i) / N));
+                        total += std::atan2(prev.cross(t), prev.dot(t));
+                        prev = t;
+                    }
+                }
             }
             const size_t corners = closed ? n : (n - 1);
             for (size_t k = 0; k < corners; k++) {
@@ -1025,6 +1157,7 @@ export namespace Geo {
                 return t.normalized();
             }
             if (isOffEll(e)) { const OffsetEllipse2* o = asOff(e); return o->tangentAt(oeParamOf(*o, p)); }
+            if (isSpline(e)) { const Spline2* o = asSpline(e); return o->tangentAt(splParamOf(*o, p)); }
             return eStartDir(e);
         }
 
@@ -1215,6 +1348,9 @@ export namespace Geo {
             else if (isOffEll(*copy)) {
                 static_cast<OffsetEllipse2*>(copy.get())->c += v;   // base centre carries the curve
             }
+            else if (isSpline(*copy)) {
+                for (Pos2& cp : static_cast<Spline2*>(copy.get())->ctrl) { cp += v; }   // whole control net rides along
+            }
             else {
                 Segment2* s = static_cast<Segment2*>(copy.get());
                 s->a += v; s->b += v;
@@ -1341,6 +1477,13 @@ export namespace Geo {
                     }
                     case SKind::Segment:
                     case SKind::Arc: { pool.push_back(e->clone()); break; }
+                    case SKind::Spline: {
+                        if (static_cast<const Spline2*>(e.get())->fullLoop()) {   // a closed spline is its own loop
+                            Chain c; c.closed = true; c.edges.push_back(e->clone()); out.push_back(std::move(c));
+                        }
+                        else { pool.push_back(e->clone()); }          // open spline: chains with its neighbours
+                        break;
+                    }
                     case SKind::Ellipse: {
                         const Ellipse2* el = static_cast<const Ellipse2*>(e.get());
                         ellipseToEdges(el->c, el->u, el->v, 0.0f, TAU);
