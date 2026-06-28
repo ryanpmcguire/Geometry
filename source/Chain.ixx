@@ -116,6 +116,17 @@ export namespace Geo {
             return r;
         }
 
+        // Append the chain as a single polyline. Every edge after the first omits its
+        // start point (it coincides with the previous edge's end), so the result has no
+        // duplicate joints — no scanning, no erasing, no zero-length segments.
+        void tessellate(std::vector<Pos>& out) const {
+            bool first = true;
+            for (const auto& e : edges) {
+                e->tessellate(out, !first);
+                first = false;
+            }
+        }
+
         // Type probes / accessors. The chain holds segments, arcs and full circles
         // (ellipses are tessellated to segments at build time).
         static bool isArc(const Stoicheion& e)    { return e.type() == SKind::Arc; }

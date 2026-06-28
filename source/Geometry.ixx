@@ -144,15 +144,15 @@ export namespace Geo {
         return std::max(2, static_cast<int>(std::ceil(std::fabs(span) / (TAU / 128.0f))));
     }
 
-    inline void sampleArc(std::vector<Pos>& out, Pos c, float r, float a0, float span, int steps) {
-        for (int i = 0; i <= steps; i++) {
+    inline void sampleArc(std::vector<Pos>& out, Pos c, float r, float a0, float span, int steps, bool skipFirst = false) {
+        for (int i = skipFirst ? 1 : 0; i <= steps; i++) {
             float a = a0 + span * (static_cast<float>(i) / steps);
             out.push_back(c + Pos::fromAngle(a) * r);
         }
     }
 
-    inline void sampleEllipse(std::vector<Pos>& out, Pos c, Pos u, Pos v, float t0, float span, int steps) {
-        for (int i = 0; i <= steps; i++) {
+    inline void sampleEllipse(std::vector<Pos>& out, Pos c, Pos u, Pos v, float t0, float span, int steps, bool skipFirst = false) {
+        for (int i = skipFirst ? 1 : 0; i <= steps; i++) {
             float t = t0 + span * (static_cast<float>(i) / steps);
             out.push_back(ellipsePointAt(c, u, v, t));
         }
@@ -316,8 +316,10 @@ export namespace Geo {
         }
 
         // Rendering: append this entity's polyline approximation (world space).
-        // Point-like entities append a single position, drawn as a dot.
-        virtual void tessellate(std::vector<Pos>& out) const = 0;
+        // Point-like entities append a single position, drawn as a dot. `skipFirst`
+        // omits the entity's first point — used when chaining edges end-to-end so a
+        // shared corner isn't emitted twice (no zero-length segments at the joints).
+        virtual void tessellate(std::vector<Pos>& out, bool skipFirst = false) const = 0;
         virtual bool isPoint() const { return false; }
 
         // This edge's exact contribution to the closed loop's signed-area integral,
@@ -441,7 +443,7 @@ export namespace Geo {
         Json data() const override { return Json{ { "p", p.toJson() } }; }
         void load(const Json& j) override { p = Pos2::fromJson(j.value("p", Json::object())); }
 
-        void tessellate(std::vector<Pos>& out) const override { out.push_back(p); }
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override { if (!skipFirst) { out.push_back(p); } }
         bool isPoint() const override { return true; }
         float distanceTo(Pos q) const override { return (q - p).pythag(); }
         void anchors(std::vector<Pos>& out) const override { out.push_back(p); }
@@ -466,7 +468,7 @@ export namespace Geo {
             b = Pos2::fromJson(j.value("b", Json::object()));
         }
 
-        void tessellate(std::vector<Pos>& out) const override { out.push_back(a); out.push_back(b); }
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override { if (!skipFirst) { out.push_back(a); } out.push_back(b); }
         // Exact: integral of (x dy - y dx) along the straight chord a -> b.
         float signedAreaTerm() const override { return a.x * b.y - a.y * b.x; }
         float distanceTo(Pos p) const override { return (p - closestOnSegment(p, a, b)).pythag(); }
@@ -535,8 +537,8 @@ export namespace Geo {
             b = Pos2::fromJson(j.value("b", Json::object()));
         }
 
-        void tessellate(std::vector<Pos>& out) const override {
-            sampleArc(out, c, radius(), (a - c).angle(), TAU, spanSteps(TAU));
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override {
+            sampleArc(out, c, radius(), (a - c).angle(), TAU, spanSteps(TAU), skipFirst);
         }
         // Exact: a full turn contributes (chirality) * r^2 * TAU (the centre terms
         // vanish since start == end). Twice the area is +-pi*r^2 * 2, i.e. r^2*TAU.
@@ -668,10 +670,10 @@ export namespace Geo {
             d = Pos2::fromJson(j.value("d", Json::object()));
         }
 
-        void tessellate(std::vector<Pos>& out) const override {
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override {
             float r = radius(); if (r <= 0.0f) { return; }
             float a0, sweep; range(a0, sweep);
-            sampleArc(out, c, r, a0, sweep, spanSteps(sweep));
+            sampleArc(out, c, r, a0, sweep, spanSteps(sweep), skipFirst);
         }
         // Exact: integral of (x dy - y dx) over the arc A -> B through D. Closed form
         // is c.x*(b.y-a.y) - c.y*(b.x-a.x) + r^2 * dtheta, where dtheta is the SIGNED
@@ -772,7 +774,7 @@ export namespace Geo {
             v = Pos2::fromJson(j.value("v", Json::object()));
         }
 
-        void tessellate(std::vector<Pos>& out) const override { sampleEllipse(out, c, u, v, 0.0f, TAU, spanSteps(TAU)); }
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override { sampleEllipse(out, c, u, v, 0.0f, TAU, spanSteps(TAU), skipFirst); }
         // Exact: a full ellipse contributes (u x v) * TAU (twice its area, signed by
         // handedness); the centre terms vanish since start == end.
         float signedAreaTerm() const override { return u.cross(v) * TAU; }
@@ -866,8 +868,8 @@ export namespace Geo {
             a0 = j.value("a0", 0.0f); a1 = j.value("a1", 0.0f);
         }
 
-        void tessellate(std::vector<Pos>& out) const override {
-            float sp = span(); sampleEllipse(out, c, u, v, a0, sp, spanSteps(sp));
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override {
+            float sp = span(); sampleEllipse(out, c, u, v, a0, sp, spanSteps(sp), skipFirst);
         }
         // Exact: integral of (x dy - y dx) over the elliptical arc, swept by parameter
         // a0 -> a0+span(). Closed form is c.x*(p1.y-p0.y) - c.y*(p1.x-p0.x) plus the
@@ -970,9 +972,9 @@ export namespace Geo {
             d = j.value("d", 0.0f); a0 = j.value("a0", 0.0f); a1 = j.value("a1", 0.0f);
         }
 
-        void tessellate(std::vector<Pos>& out) const override {
+        void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override {
             int steps = spanSteps(std::fabs(a1 - a0));
-            for (int i = 0; i <= steps; i++) { out.push_back(pointAt(static_cast<float>(i) / steps)); }
+            for (int i = skipFirst ? 1 : 0; i <= steps; i++) { out.push_back(pointAt(static_cast<float>(i) / steps)); }
         }
 
         // Quadrature of ∮(x dy - y dx): the chord shoelace over a fine sampling of
