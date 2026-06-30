@@ -127,6 +127,18 @@ export namespace Geo {
             }
         }
 
+        // Travel-ordered polyline (start -> end), respecting each edge's actual direction — for
+        // toolpaths, where an arc's handedness IS the motion (a CW arc must connect A -> B, not
+        // be reversed to B -> A the way the drawing tessellate() would). Mirrors tessellate()
+        // but defers to each edge's tessellateDirected.
+        void tessellateDirected(std::vector<Pos>& out) const {
+            bool first = true;
+            for (const auto& e : edges) {
+                e->tessellateDirected(out, !first);
+                first = false;
+            }
+        }
+
         // Type probes / accessors. The chain holds segments, arcs and full circles
         // (ellipses are tessellated to segments at build time).
         static bool isArc(const Stoicheion& e)    { return e.type() == SKind::Arc; }

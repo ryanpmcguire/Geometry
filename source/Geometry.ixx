@@ -317,6 +317,15 @@ export namespace Geo {
         // omits the entity's first point — used when chaining edges end-to-end so a
         // shared corner isn't emitted twice (no zero-length segments at the joints).
         virtual void tessellate(std::vector<Pos>& out, bool skipFirst = false) const = 0;
+
+        // Travel-ordered tessellation (start -> end), unlike tessellate() which returns the
+        // direction-agnostic point set (range()) used for drawing/hit-testing. Toolpaths need
+        // travel order — an arc's handedness is its motion. The default is fine for points and
+        // segments (already ordered); direction-bearing edges (arcs, circles) override it.
+        virtual void tessellateDirected(std::vector<Pos>& out, bool skipFirst = false) const {
+            tessellate(out, skipFirst);
+        }
+
         virtual bool isPoint() const { return false; }
 
         // This edge's exact contribution to the closed loop's signed-area integral,
@@ -530,6 +539,11 @@ export namespace Geo {
         void tessellate(std::vector<Pos>& out, bool skipFirst = false) const override {
             sampleArc(out, c, radius(), (a - c).angle(), TAU, spanSteps(TAU), skipFirst);
         }
+        // Travel order: sweep a full turn in the ring's actual direction (signed TAU), so a CW
+        // circle isn't emitted CCW. tessellate() above is always CCW (drawing doesn't care).
+        void tessellateDirected(std::vector<Pos>& out, bool skipFirst = false) const override {
+            sampleArc(out, c, radius(), (a - c).angle(), (chirality() > 0) ? TAU : -TAU, spanSteps(TAU), skipFirst);
+        }
         // Exact: a full turn contributes (chirality) * r^2 * TAU (the centre terms
         // vanish since start == end). Twice the area is +-pi*r^2 * 2, i.e. r^2*TAU.
         float signedAreaTerm() const override {
@@ -664,6 +678,17 @@ export namespace Geo {
             float r = radius(); if (r <= 0.0f) { return; }
             float a0, sweep; range(a0, sweep);
             sampleArc(out, c, r, a0, sweep, spanSteps(sweep), skipFirst);
+        }
+        // Travel order: emit A -> B following the arc's actual chirality (through D), as a SIGNED
+        // sweep from A (negative = CW). Unlike tessellate()/range() — which return the CCW point
+        // set and so emit a CW arc reversed (B -> A) — this preserves the motion's handedness.
+        void tessellateDirected(std::vector<Pos>& out, bool skipFirst = false) const override {
+            float r = radius();
+            if (r <= 0.0f) { if (!skipFirst) { out.push_back(a); } out.push_back(b); return; }
+            float angA = (a - c).angle();
+            float ccwB = wrapTau((b - c).angle() - angA);
+            float sweep = (chirality() > 0) ? ccwB : -(TAU - ccwB);   // signed travel sweep from A
+            sampleArc(out, c, r, angA, sweep, spanSteps(std::fabs(sweep)), skipFirst);
         }
         // Exact: integral of (x dy - y dx) over the arc A -> B through D. Closed form
         // is c.x*(b.y-a.y) - c.y*(b.x-a.x) + r^2 * dtheta, where dtheta is the SIGNED
