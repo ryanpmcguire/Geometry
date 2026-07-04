@@ -247,10 +247,13 @@ Geo::SliceResult& out = strategy.run();     // prepare → generations → steps
 ### The generation ladder
 
 `run()` drops open chains at the door (offsetting has no concept of them), then applies
-the strategy's own preparation: every open-air edge is rigidly pushed `1.333 × R` into
-the free region — far enough that the tool's sweep fully covers corners against open
-space, and clear of the exact-tangency degeneracy. (This is *toolpathy* logic, which is
-why it lives here and not in the chain method.)
+the strategy's own preparation: every open-air edge is **offset** `1.333 × R` into the
+free region — each alone, as the true parallel curve of itself (with material on the
+left of travel, the air is the right, so this is exactly the *opposite* of the inset the
+generations run) — and rejoined to its former neighbours with straight bridge segments.
+Far enough that the tool's sweep fully covers corners against open space, and clear of
+the exact-tangency degeneracy. (Deciding to do this at all is *toolpathy* logic, which
+is why the call lives in the strategy, not the chain method.)
 
 Then the ladder, for the Profile kind:
 

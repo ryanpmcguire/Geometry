@@ -156,13 +156,13 @@ export namespace Geo {
             // a RESULT are the link segments the strategy itself weaves).
             std::erase_if(seed.chains, [](const Chain& c) { return !c.closed; });
 
-            // The strategy's own preparation: open-air edges pre-pushed into the
+            // The strategy's own preparation: open-air edges pre-offset into the
             // free region (full corner coverage; 1.333R sits clear of the
             // exact-tangency degeneracy). Toolpathy logic -- it belongs here, not
             // in the method.
             if (params.kind == StrategyKind::Profile) {
                 for (Chain& c : seed.chains) {
-                    c = c.withOpenAirPushed(params.toolRadius * 1.333f);
+                    c = c.withOpenAirOffset(params.toolRadius * 1.333f);
                 }
             }
 

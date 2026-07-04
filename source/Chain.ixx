@@ -1345,73 +1345,54 @@ export namespace Geo {
             return out;
         }
 
-        // Rigidly TRANSLATE an edge by a vector -- no offsetting, no re-radiusing,
-        // every point moves identically. (Toolpathy logic, not geometric logic.)
-        static std::unique_ptr<Stoicheion> translatedEdge(const Stoicheion& e, Pos v) {
-            std::unique_ptr<Stoicheion> copy = e.clone();
-            if (isArc(*copy)) {
-                Arc2* a = static_cast<Arc2*>(copy.get());
-                a->c += v; a->a += v; a->b += v; a->d += v;
-            }
-            else if (isCircle(*copy)) {
-                Circle2* k = static_cast<Circle2*>(copy.get());
-                k->c += v; k->a += v; k->b += v;
-            }
-            else if (isOffEll(*copy)) {
-                static_cast<OffsetEllipse2*>(copy.get())->c += v;   // base centre carries the curve
-            }
-            else if (isSpline(*copy)) {
-                for (Pos2& cp : static_cast<Spline2*>(copy.get())->ctrl) { cp += v; }   // whole control net rides along
-            }
-            else {
-                Segment2* s = static_cast<Segment2*>(copy.get());
-                s->a += v; s->b += v;
-            }
-            return copy;
-        }
-
-        // Open-air pre-push: every edge marked openAir is rigidly TRANSLATED
-        // `amount` to the right of its travel (with material on the left, right is
-        // the free air), and the gaps this opens to its neighbours are bridged with
-        // straight segments. Run on profile 0 BEFORE the recursion; nothing
-        // downstream treats these edges differently -- the chain is simply moved,
-        // then offset exactly as always. The slight push guarantees the tool's
+        // Open-air pre-offset: every edge marked openAir is OFFSET `amount` into
+        // the free region -- each alone, as a single independent edge, the true
+        // parallel curve of itself (not a rigid translation picked at one sample
+        // point, so a curved open edge stays exactly equidistant from its original
+        // everywhere). With material on the LEFT of travel the air is the right,
+        // so the push is offsetLeft by -amount -- the exact opposite of the inset
+        // the generations run -- and the side comes from each edge's own travel;
+        // no chain-level winding measurement is needed. Untagged edges are not
+        // touched; the gaps the push opens are bridged by rejoining each moved
+        // edge to its former exact neighbours with straight segments. Run on
+        // profile 0 BEFORE the recursion; nothing downstream treats these edges
+        // differently -- the chain is simply conditioned, then offset exactly as
+        // always. The slight overshoot the caller passes guarantees the tool's
         // sweep clears the original open boundary with margin, fully covering the
         // corners against the open region.
-        Chain withOpenAirPushed(float amount, float eps = 1e-4f) const {
+        Chain withOpenAirOffset(float amount, float eps = 1e-4f) const {
             Chain out;
             out.closed = closed;
-            const size_t n = edges.size();
-            if (n == 0) { return out; }
+            out.id = id; out.parent = parent; out.link = link;
+            if (edges.empty()) { return out; }
 
             bool any = false;
             for (const auto& e : edges) { if (e->openAir) { any = true; break; } }
             if (!any) { return clone(); }
 
-            // Translate open-air edges OUTWARD -- away from the chain's own
-            // enclosed interior, measured, not assumed: a closed chain's interior
-            // lies to the LEFT of travel iff its turning sign is positive, so
-            // outward is the left normal scaled by -turningSign. Wrong-signing
-            // this pushes the edge a full radius INTO the material, slicing the
-            // chain apart -- so the side must come from the chain, never from a
-            // convention about which way "right" is.
-            const float outwardSign = (closed && turningSign() < 0) ? 1.0f : -1.0f;
+            // The push. An edge that collapses under the offset (an arc driven
+            // through extinction) is dropped; the bridge below spans its hole.
             std::vector<std::unique_ptr<Stoicheion>> moved;
             for (const auto& e : edges) {
                 if (!e->openAir) { moved.push_back(e->clone()); continue; }
-                Pos mid = edgeMidpoint(*e);
-                Pos t = travelDirAt(*e, mid);
-                Pos outward = perpCCW(t) * outwardSign;     // away from the interior
-                moved.push_back(translatedEdge(*e, outward * amount));
+                std::unique_ptr<Stoicheion> o = offsetLeft(*e, -amount);   // right of travel: the air
+                if (edgeLength(*o) < PruneLength) { continue; }
+                o->id = e->id;                                             // carried properties survive
+                o->construction = e->construction;
+                o->openAir = e->openAir;
+                o->group = e->group;
+                o->groupLevel = e->groupLevel;
+                moved.push_back(std::move(o));
             }
 
-            // Re-walk, bridging every gap a displacement opened.
-            for (size_t i = 0; i < n; i++) {
+            // Re-walk, bridging every gap the push opened.
+            const size_t m = moved.size();
+            for (size_t i = 0; i < m; i++) {
                 out.edges.push_back(std::move(moved[i]));
-                bool last = (i + 1 == n);
+                bool last = (i + 1 == m);
                 if (last && !closed) { break; }
                 const Stoicheion& cur = *out.edges.back();
-                const Stoicheion& nxt = last ? *out.edges.front() : *moved[(i + 1) % n];
+                const Stoicheion& nxt = last ? *out.edges.front() : *moved[(i + 1) % m];
                 Pos a = eEnd(cur), b = eStart(nxt);
                 if ((a - b).pythag() > eps) {
                     out.edges.push_back(std::make_unique<Segment2>(a, b));
