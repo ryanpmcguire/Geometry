@@ -524,7 +524,13 @@ export namespace Geo {
             // morphing against the original profile does, since its inset can split).
             // The lead's landing curve is `O` (~the cut), so it approaches smoothly --
             // not the inset with a straight stub. Null when the feature can't inset.
-            const float safe = params.toolRadius * std::max(0.02f, params.leadInset);
+            // Conventional milling reversed every run chain before linking, which flips the
+            // side a positive offset lands on — sign the inset so it still lands on the
+            // cleared side. Keyed on params.climb, NOT per-chain winding: a keep-island ring
+            // is legitimately CW in climb mode and its +offset is already the safe side.
+            // (Band-aid until leads are rebuilt on doctrine-oriented chains.)
+            const float safe = (params.climb ? 1.0f : -1.0f)
+                             * params.toolRadius * std::max(0.02f, params.leadInset);
             auto leadCurves = [&](const Chain& target, Pos near,
                                   std::optional<Chain>& inner, std::optional<Chain>& outer,
                                   Pos& outerPt, size_t& outerK) -> bool {
