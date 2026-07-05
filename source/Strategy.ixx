@@ -163,7 +163,7 @@ export namespace Geo {
             // amount. Toolpathy logic -- it belongs here, not in the method.
             if (params.kind == StrategyKind::Profile) {
                 for (Chain& c : seed.chains) {
-                    c = c.withOpenAirOffset(params.toolRadius * 2.667f);
+                    c = c.withOpenAirOffset(params.toolRadius * 2.1f);
                 }
             }
 
@@ -750,7 +750,10 @@ export namespace Geo {
                 for (const Chain& c : seed0.chains) {
 
                     if (!c.closed || c.edges.empty()) { continue; }
-                    if (c.turningSign() <= 0) { continue; }        // regions only, never islands
+                    // Regions only, never islands -- by SIGNED AREA: a sliver seed's
+                    // tangency cusps make turningSign unreliable, and the sweep exists
+                    // precisely for such slivers.
+                    if (c.signedArea() <= 0.0f) { continue; }
 
                     bool anyAir = false, anyWall = false;
                     for (const auto& e : c.edges) {

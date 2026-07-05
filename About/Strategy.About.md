@@ -250,13 +250,26 @@ Geo::SliceResult& out = strategy.run();     // prepare → generations → steps
 the strategy's own preparation: every open-air edge is **offset** out into the free
 region — each alone, as the true parallel curve of itself (with material on the left of
 travel, the air is the right, so this is exactly the *opposite* of the inset the
-generations run) — and rejoined to its former neighbours with straight bridge segments,
-themselves marked open-air (they span ground the push vacated). The push amount must
-fund **both** sides of generation 1's inset: a wall-backed sliver erodes by `2R` (R from
-the wall side *and* R from the air side — the offset method is uniform and grants the
-air no discount), so the push runs past `2R` with margin, not merely past the
-exact-tangency `R`. (Deciding to do this at all is *toolpathy* logic, which is why the
-call lives in the strategy, not the chain method.)
+generations run). The gaps the push opens are rejoined with **arcs tangent to what they
+join**. Between two *pushed* neighbours: the same arc-known-by-construction the
+recursive solver builds at every offset corner — centred on the original corner, radius
+= the push, tangent to both pushed edges (a corner point offsets to an arc; a chamfer
+is not the parallel boundary). At a *wall/air transition*: the tangent **fillet** from
+the perimeter's unmoved endpoint onto the pushed edge — at a tangency-reversal tip this
+is the half-circle of radius push/2, whose generation-1 inset grazes the tip vertex at
+exactly one tool radius. The fillet passes *through* the vertex leaving along the
+wall's own tangent, staying inside the wedge the tagging certified as air (a cap
+*centred* on the vertex would bulge across the wall — that construction is forbidden).
+Straight bridges remain only where an arc would be wrong: converging corners (the
+long-way-round loop self-crosses, and a seed must stay a simple loop) and lateral steps
+at mid-edge wall/air splits (a tangent join there is an S-biarc; the fillet
+construction self-reports the mismatch and stands down). Every join lies in vacated
+ground, so it is marked open-air itself. The push amount must fund **both**
+sides of generation 1's inset: a wall-backed sliver erodes by `2R` (R from the wall side
+*and* R from the air side — the offset method is uniform and grants the air no
+discount), so the push runs past `2R` with margin, not merely past the exact-tangency
+`R`. (Deciding to do this at all is *toolpathy* logic, which is why the call lives in
+the strategy, not the chain method.)
 
 Then the ladder, for the Profile kind:
 

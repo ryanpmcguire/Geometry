@@ -1353,13 +1353,33 @@ export namespace Geo {
         // so the push is offsetLeft by -amount -- the exact opposite of the inset
         // the generations run -- and the side comes from each edge's own travel;
         // no chain-level winding measurement is needed. Untagged edges are not
-        // touched; the gaps the push opens are bridged by rejoining each moved
-        // edge to its former exact neighbours with straight segments. Run on
-        // profile 0 BEFORE the recursion; nothing downstream treats these edges
-        // differently -- the chain is simply conditioned, then offset exactly as
-        // always. The slight overshoot the caller passes guarantees the tool's
-        // sweep clears the original open boundary with margin, fully covering the
-        // corners against the open region.
+        // touched.
+        //
+        // The gaps the push opens are then rejoined with ARCS, tangent to what
+        // they join:
+        //   * Between two PUSHED neighbours: the same arc the recursive solver
+        //     builds at every offset corner -- known by construction, centred on
+        //     the ORIGINAL corner, radius = the push, tangent to both pushed
+        //     edges. A corner point offsets to an arc; a chamfer is not the
+        //     parallel boundary.
+        //   * At a wall/air TRANSITION: the tangent FILLET from the perimeter's
+        //     unmoved endpoint to the pushed edge's start -- tangent to the wall
+        //     at one end and the pushed edge at the other (at a tangency-reversal
+        //     tip this is the half-circle of radius push/2, whose later inset
+        //     grazes the tip vertex at exactly the tool radius). It passes
+        //     THROUGH the vertex leaving along the wall's own tangent, so it
+        //     stays inside the wedge the tagging certified as air -- unlike a cap
+        //     CENTRED on the vertex, which would bulge across the wall.
+        // Straight bridges remain only where an arc would be wrong: CONVERGING
+        // corners (the long-way-round loop self-crosses, and a SEED must stay a
+        // simple loop -- nothing downstream trims it), lateral STEPS at mid-edge
+        // wall/air splits (a tangent join there is an S-biarc, and the fillet
+        // construction self-reports the mismatch), and any join whose neighbours
+        // lost adjacency to pruning. Every join lies in ground the push vacated,
+        // so it is itself open-air -- marking it so keeps the chain's non-open-air
+        // runs EXACTLY the original wall edges (the degenerate-sweep fallback
+        // reads them). Run on profile 0 BEFORE the recursion; nothing downstream
+        // treats these edges differently.
         Chain withOpenAirOffset(float amount, float eps = 1e-4f) const {
             Chain out;
             out.closed = closed;
@@ -1371,10 +1391,21 @@ export namespace Geo {
             if (!any) { return clone(); }
 
             // The push. An edge that collapses under the offset (an arc driven
-            // through extinction) is dropped; the bridge below spans its hole.
+            // through extinction) is dropped; the join below spans its hole.
+            // Each survivor remembers its source edge, so the re-walk knows which
+            // gaps sit between pushed neighbours and where their original corner is.
+            const size_t n = edges.size();
             std::vector<std::unique_ptr<Stoicheion>> moved;
-            for (const auto& e : edges) {
-                if (!e->openAir) { moved.push_back(e->clone()); continue; }
+            std::vector<size_t> from;                      // moved[i] came from edges[from[i]]
+            std::vector<bool> wasPushed;
+            for (size_t i = 0; i < n; i++) {
+                const auto& e = edges[i];
+                if (!e->openAir) {
+                    moved.push_back(e->clone());
+                    from.push_back(i);
+                    wasPushed.push_back(false);
+                    continue;
+                }
                 std::unique_ptr<Stoicheion> o = offsetLeft(*e, -amount);   // right of travel: the air
                 if (edgeLength(*o) < PruneLength) { continue; }
                 o->id = e->id;                                             // carried properties survive
@@ -1383,25 +1414,102 @@ export namespace Geo {
                 o->group = e->group;
                 o->groupLevel = e->groupLevel;
                 moved.push_back(std::move(o));
+                from.push_back(i);
+                wasPushed.push_back(true);
             }
 
-            // Re-walk, bridging every gap the push opened. A bridge spans ground the
-            // push vacated, so it lies in the free region -- it is itself open-air,
-            // and marking it so keeps the chain's non-open-air runs EXACTLY the
-            // original wall edges (the degenerate-sweep fallback reads them).
+            // Re-walk, joining every gap the push opened.
             const size_t m = moved.size();
             for (size_t i = 0; i < m; i++) {
                 out.edges.push_back(std::move(moved[i]));
                 bool last = (i + 1 == m);
                 if (last && !closed) { break; }
+                const size_t j = last ? 0 : i + 1;
                 const Stoicheion& cur = *out.edges.back();
-                const Stoicheion& nxt = last ? *out.edges.front() : *moved[(i + 1) % m];
+                const Stoicheion& nxt = last ? *out.edges.front() : *moved[j];
                 Pos a = eEnd(cur), b = eStart(nxt);
-                if ((a - b).pythag() > eps) {
-                    auto bridge = std::make_unique<Segment2>(a, b);
-                    bridge->openAir = true;
-                    out.edges.push_back(std::move(bridge));
+                if ((a - b).pythag() <= eps) { continue; }
+
+                std::unique_ptr<Stoicheion> join;
+                const bool adjacent = ((from[i] + 1) % n) == from[j];
+
+                // Wall/air transition: the arc TANGENT AT THE PERIMETER, exact
+                // through the pushed endpoint. Tangency at BOTH ends is over-
+                // constrained here (it exists only in the symmetric reversal case,
+                // where this construction reduces to it), so the centre is built
+                // from what is actually demanded: on the perimeter endpoint's
+                // tangent-perpendicular (tangency at the wall) AND on the gap's
+                // perpendicular bisector (both endpoints on one circle). Verified,
+                // not trusted: a sane radius, the short way round, and neither end
+                // doubling back on its edge -- a mid-edge lateral step's arc lands
+                // reversed and stands down to the straight radial, which there
+                // (and whenever the wall arrives along the push direction, where
+                // the centre recedes to infinity) IS the tangent join.
+                if (adjacent && (wasPushed[i] != wasPushed[j])) {
+                    Pos ta = eEndDir(cur), tb = eStartDir(nxt);
+                    const bool wallFirst = !wasPushed[i];      // which end anchors the tangency
+                    dPos A(a), B(b);
+                    dPos u = B - A;
+                    double gap = u.len();
+                    dPos tAnchor(wallFirst ? ta : tb);
+                    double denom = tAnchor.perp().dot(wallFirst ? u : u * -1.0);
+                    if (gap > 1e-9 && std::fabs(denom) > 1e-6 * gap) {
+                        double t = (gap * gap * 0.5) / denom;
+                        dPos centre = (wallFirst ? A : B) + tAnchor.perp() * t;
+                        double r = (A - centre).len();
+                        if (r > 0.05 * amount && r < 4.0 * amount) {
+                            dPos radial = (wallFirst ? A : B) - centre;
+                            int s = (tAnchor.dot(radial.perp()) >= 0.0) ? 1 : -1;
+                            double angA = (A - centre).angle(), angB = (B - centre).angle();
+                            double span = (s > 0) ? dWrap(angB - angA) : dWrap(angA - angB);
+                            if (span <= static_cast<double>(PI) + 0.05) {
+                                double midAng = angA + static_cast<double>(s) * span * 0.5;
+                                auto arc = std::make_unique<Arc2>(centre.f(), a, b,
+                                    (centre + dPos::fromAngle(midAng) * r).f());
+                                if (eStartDir(*arc).dot(ta) > 0.0f && eEndDir(*arc).dot(tb) > 0.0f) {
+                                    join = std::move(arc);
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // The join arc: both neighbours pushed, still adjacent in the
+                // source (nothing dropped between them), and not a near-tangent
+                // seam (which barely opens and seals flat, offsetRaw's fuse rule).
+                if (wasPushed[i] && wasPushed[j] && adjacent) {
+                    Pos ta = eEndDir(cur), tb = eStartDir(nxt);
+                    if (!(std::fabs(ta.cross(tb)) < FuseSin && ta.dot(tb) > 0.0f)) {
+
+                        // offsetRaw's construction verbatim: centred on the original
+                        // corner, radius measured from the pushed endpoint, travel
+                        // continuing edge A's direction, through-point at the swept
+                        // midpoint. All angle math in DOUBLE (a nearly-complete arc
+                        // subtracts nearly-equal angles).
+                        Pos corner = eEnd(*edges[from[i]]);
+                        dPos C(corner);
+                        dPos radial = dPos(a) - C;
+                        double r = radial.len();
+                        double rb = (dPos(b) - C).len();
+                        if (r > 1e-9 && std::fabs(rb - r) <= 0.05 * r) {
+                            int s = (dPos(ta).dot(radial.perp()) >= 0.0) ? 1 : -1;
+                            double angA = radial.angle(), angB = (dPos(b) - C).angle();
+                            double span = (s > 0) ? dWrap(angB - angA) : dWrap(angA - angB);
+
+                            // Diverging corners only: past pi the pair converges, and
+                            // the long-way-round loop would self-cross the seed.
+                            if (span <= static_cast<double>(PI) + 1e-3) {
+                                double midAng = angA + static_cast<double>(s) * span * 0.5;
+                                join = std::make_unique<Arc2>(corner, a, b,
+                                    (C + dPos::fromAngle(midAng) * r).f());
+                            }
+                        }
+                    }
+                }
+
+                if (!join) { join = std::make_unique<Segment2>(a, b); }
+                join->openAir = true;
+                out.edges.push_back(std::move(join));
             }
             return out;
         }
