@@ -1385,7 +1385,10 @@ export namespace Geo {
                 moved.push_back(std::move(o));
             }
 
-            // Re-walk, bridging every gap the push opened.
+            // Re-walk, bridging every gap the push opened. A bridge spans ground the
+            // push vacated, so it lies in the free region -- it is itself open-air,
+            // and marking it so keeps the chain's non-open-air runs EXACTLY the
+            // original wall edges (the degenerate-sweep fallback reads them).
             const size_t m = moved.size();
             for (size_t i = 0; i < m; i++) {
                 out.edges.push_back(std::move(moved[i]));
@@ -1395,7 +1398,9 @@ export namespace Geo {
                 const Stoicheion& nxt = last ? *out.edges.front() : *moved[(i + 1) % m];
                 Pos a = eEnd(cur), b = eStart(nxt);
                 if ((a - b).pythag() > eps) {
-                    out.edges.push_back(std::make_unique<Segment2>(a, b));
+                    auto bridge = std::make_unique<Segment2>(a, b);
+                    bridge->openAir = true;
+                    out.edges.push_back(std::move(bridge));
                 }
             }
             return out;

@@ -247,13 +247,16 @@ Geo::SliceResult& out = strategy.run();     // prepare → generations → steps
 ### The generation ladder
 
 `run()` drops open chains at the door (offsetting has no concept of them), then applies
-the strategy's own preparation: every open-air edge is **offset** `1.333 × R` into the
-free region — each alone, as the true parallel curve of itself (with material on the
-left of travel, the air is the right, so this is exactly the *opposite* of the inset the
-generations run) — and rejoined to its former neighbours with straight bridge segments.
-Far enough that the tool's sweep fully covers corners against open space, and clear of
-the exact-tangency degeneracy. (Deciding to do this at all is *toolpathy* logic, which
-is why the call lives in the strategy, not the chain method.)
+the strategy's own preparation: every open-air edge is **offset** out into the free
+region — each alone, as the true parallel curve of itself (with material on the left of
+travel, the air is the right, so this is exactly the *opposite* of the inset the
+generations run) — and rejoined to its former neighbours with straight bridge segments,
+themselves marked open-air (they span ground the push vacated). The push amount must
+fund **both** sides of generation 1's inset: a wall-backed sliver erodes by `2R` (R from
+the wall side *and* R from the air side — the offset method is uniform and grants the
+air no discount), so the push runs past `2R` with margin, not merely past the
+exact-tangency `R`. (Deciding to do this at all is *toolpathy* logic, which is why the
+call lives in the strategy, not the chain method.)
 
 Then the ladder, for the Profile kind:
 
@@ -332,6 +335,25 @@ One last courtesy to the part: an outer boundary ring's start/end seam would lea
 faint witness bump on the finished wall. So every generation-1 ring **overshoots**:
 after closing its loop, the tool carries on along the chain by one tool radius,
 re-cutting the seam clean. Inner rings never witness a wall and are left alone.
+
+### The degenerate sweep — the rung below extinction
+
+A seed chain that was *given* open air and still left no generation-1 child has measured
+its own verdict: the region is narrower than the tool even after the push funded both
+sides of the inset. But that verdict is simultaneously a guarantee — a region thinner
+than the tool is cleared **entirely by one pass** riding a single radius off its walls,
+overhanging into the air. So instead of silently emitting nothing, the strategy insets
+the chain's non-open-air runs *blindly* (each wall edge one radius left of travel, gaps
+bridged straight) and emits each run as an **open** cut chain, capped by straight
+tangent leads — both ends hang in free air, so the ramps descend and climb over
+nothing.
+
+Two rules keep it honest. Only chains that *had* air qualify: a childless chain walled
+all the way round is genuinely uncuttable by this tool, and stays uncut. And no-touch
+stays sovereign — the sweep is *measured* against every wall it isn't itself riding,
+and one that would pass within a tool radius of an opposing wall (a thin slot walled on
+both sides) is refused with a warning rather than emitted. Like generation 1, sweeps
+are a wall pass, so they respect `emitOuter`.
 
 ---
 

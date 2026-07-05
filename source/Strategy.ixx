@@ -157,12 +157,13 @@ export namespace Geo {
             std::erase_if(seed.chains, [](const Chain& c) { return !c.closed; });
 
             // The strategy's own preparation: open-air edges pre-offset into the
-            // free region (full corner coverage; 1.333R sits clear of the
-            // exact-tangency degeneracy). Toolpathy logic -- it belongs here, not
-            // in the method.
+            // free region. The push must fund BOTH sides of generation 1's inset
+            // (a wall-backed sliver erodes by 2R) plus margin off the exact-
+            // tangency degeneracy -- hence past 2R, not the bare corner-coverage
+            // amount. Toolpathy logic -- it belongs here, not in the method.
             if (params.kind == StrategyKind::Profile) {
                 for (Chain& c : seed.chains) {
-                    c = c.withOpenAirOffset(params.toolRadius * 1.333f);
+                    c = c.withOpenAirOffset(params.toolRadius * 2.667f);
                 }
             }
 
@@ -711,6 +712,171 @@ export namespace Geo {
                 haveCursor = true;
 
                 result.toolpath.push_back(std::move(next));
+            }
+
+            // The DEGENERATE SWEEP -- the last rung below extinction. A seed chain
+            // that was GIVEN open air and still left no first-generation child has
+            // measured its own verdict: the region is narrower than the tool even
+            // after the push funded both sides of the inset. But that same verdict
+            // is a guarantee -- a region thinner than the tool is cleared entirely
+            // by ONE pass riding a single radius off its walls, overhanging into
+            // the air. So the fallback insets the chain's non-open-air runs
+            // BLINDLY (each wall edge one radius left of travel, gaps bridged
+            // straight) and emits each run as an OPEN cut chain, capped by
+            // straight tangent leads: both ends hang in free air, so the ramps
+            // descend and climb over nothing. No-touch stays sovereign: a sweep
+            // that would ride within one radius of any OTHER wall (a thin slot
+            // walled on both sides) is refused with a warning, not emitted. Only
+            // chains that had air qualify -- a childless chain walled all round is
+            // genuinely uncuttable by this tool. Like generation 1, sweeps are the
+            // wall pass, so they obey emitOuter.
+            if (params.kind == StrategyKind::Profile && params.emitOuter &&
+                params.toolRadius > 1e-4f && !result.profiles.empty()) {
+
+                const Profile& seed0 = result.profiles.front();
+
+                // Children count as coverage only if generation 1 actually CUT: a
+                // gen-1 the sanity rule disqualified (negative, unbounded claim)
+                // cleared nothing, so its chains must not veto the sweep.
+                auto hasChildren = [&](Id id) {
+                    if (result.profiles.size() < 2) { return false; }
+                    if (!result.steps.empty() && !result.steps.front().included) { return false; }
+                    for (const Chain& g : result.profiles[1].chains) {
+                        if (g.parent == id) { return true; }
+                    }
+                    return false;
+                };
+
+                for (const Chain& c : seed0.chains) {
+
+                    if (!c.closed || c.edges.empty()) { continue; }
+                    if (c.turningSign() <= 0) { continue; }        // regions only, never islands
+
+                    bool anyAir = false, anyWall = false;
+                    for (const auto& e : c.edges) {
+                        if (e->openAir) { anyAir = true; } else { anyWall = true; }
+                    }
+                    if (!anyAir || !anyWall) { continue; }
+                    if (hasChildren(c.id)) { continue; }           // it generated: the ladder handled it
+
+                    // Wall runs: maximal consecutive non-open-air stretches, scanned
+                    // from an open-air edge so no run splits across the seam.
+                    const size_t n = c.edges.size();
+                    size_t first = 0;
+                    while (first < n && !c.edges[first]->openAir) { first++; }
+
+                    std::vector<std::vector<const Stoicheion*>> walls;
+                    bool inRun = false;
+                    for (size_t k = 0; k < n; k++) {
+                        const Stoicheion* e = c.edges[(first + k) % n].get();
+                        if (e->openAir) { inRun = false; continue; }
+                        if (!inRun) { walls.emplace_back(); inRun = true; }
+                        walls.back().push_back(e);
+                    }
+
+                    for (const std::vector<const Stoicheion*>& wall : walls) {
+
+                        // The blind inset: the sweep is the wall run carried one tool
+                        // radius into the region, gaps bridged straight.
+                        Chain sweep;
+                        sweep.closed = false;
+                        sweep.id = newId();
+                        sweep.parent = c.id;
+                        for (const Stoicheion* e : wall) {
+                            std::unique_ptr<Stoicheion> o = Chain::offsetLeft(*e, params.toolRadius);
+                            if (Chain::edgeLength(*o) < 1e-4f) { continue; }
+                            if (!sweep.edges.empty()) {
+                                Pos a = Chain::eEnd(*sweep.edges.back());
+                                Pos b = Chain::eStart(*o);
+                                if ((b - a).pythag() > 1e-4f) {
+                                    sweep.edges.push_back(std::make_unique<Segment2>(a, b));
+                                }
+                            }
+                            sweep.edges.push_back(std::move(o));
+                        }
+                        if (sweep.edges.empty()) { continue; }
+
+                        // The no-touch guard, measured: the sweep must clear every
+                        // wall it is not itself riding by a full radius.
+                        std::vector<const Stoicheion*> others;
+                        for (const Chain& oc : seed0.chains) {
+                            for (const auto& oe : oc.edges) {
+                                if (oe->openAir) { continue; }
+                                bool own = false;
+                                for (const Stoicheion* w : wall) { if (w == oe.get()) { own = true; break; } }
+                                if (!own) { others.push_back(oe.get()); }
+                            }
+                        }
+                        bool gouges = false;
+                        for (const auto& e : sweep.edges) {
+                            for (int i = 0; i <= 8 && !gouges; i++) {
+                                Pos p = Chain::edgePointAt(*e, static_cast<float>(i) / 8.0f);
+                                for (const Stoicheion* w : others) {
+                                    if (w->distanceTo(p) < params.toolRadius - 1e-3f) { gouges = true; break; }
+                                }
+                            }
+                            if (gouges) { break; }
+                        }
+                        if (gouges) {
+                            result.warnings.push_back(
+                                "A region narrower than the tool was left uncut: its single-sweep "
+                                "pass would ride into an opposing wall.");
+                            continue;
+                        }
+
+                        if (!params.climb) { sweep = sweep.reversed(); }
+
+                        Pos s = Chain::eStart(*sweep.edges.front());
+                        Pos t = Chain::eEnd(*sweep.edges.back());
+                        Pos sd = Chain::eStartDir(*sweep.edges.front());
+                        Pos td = Chain::eEndDir(*sweep.edges.back());
+
+                        // Straight tangent caps, both ends in open air.
+                        Pos linkTarget = s;
+                        std::optional<Chain> leadIn, leadOut;
+                        if (params.lead && leadRun > 1e-4f) {
+                            Chain li; li.closed = false; li.id = newId(); li.link = LinkKind::LeadIn;
+                            li.edges.push_back(std::make_unique<Segment2>(s - sd * leadRun, s));
+                            linkTarget = s - sd * leadRun;
+                            leadIn = std::move(li);
+                        }
+                        if (params.lead && leadOutRun > 1e-4f) {
+                            Chain lo; lo.closed = false; lo.id = newId(); lo.link = LinkKind::LeadOut;
+                            lo.edges.push_back(std::make_unique<Segment2>(t, t + td * leadOutRun));
+                            leadOut = std::move(lo);
+                        }
+
+                        // Ease off the previous closed cut before retracting to the
+                        // sweep, the same pairing the main loop keeps.
+                        if (params.lead && haveCursor && prevCut) {
+                            Pos outEnd;
+                            Chain lo = buildLeadOut(*prevCut, cursor, leadOutRun, outEnd);
+                            if (!lo.edges.empty()) {
+                                result.toolpath.push_back(std::move(lo));
+                                cursor = outEnd;
+                            }
+                            prevCut.reset();
+                        }
+
+                        if (haveCursor && (linkTarget - cursor).pythag() > 1e-4f) {
+                            Chain link;
+                            link.closed = false;
+                            link.id = newId();
+                            link.link = LinkKind::Retract;
+                            link.edges.push_back(std::make_unique<Segment2>(cursor, linkTarget));
+                            result.toolpath.push_back(std::move(link));
+                        }
+
+                        if (leadIn) { result.toolpath.push_back(std::move(*leadIn)); }
+                        result.toolpath.push_back(std::move(sweep));
+                        cursor = t;
+                        if (leadOut) {
+                            cursor = t + td * leadOutRun;
+                            result.toolpath.push_back(std::move(*leadOut));
+                        }
+                        haveCursor = true;
+                    }
+                }
             }
         }
     };
