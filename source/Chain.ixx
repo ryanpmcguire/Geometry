@@ -73,9 +73,14 @@ export namespace Geo {
                    // link and before the cut (the consumer descends it into the cut)
         LeadOut,   // lead-out: the mirror, easing OFF the cut before the retract lifts
                    // (the consumer climbs it back out of the cut)
-        Finish     // a CUTTING chain like None, but flagged as the thin finishing pass
+        Finish,    // a CUTTING chain like None, but flagged as the thin finishing pass
                    // (a small inset taken just after the boundary-clearance ring) so a
                    // consumer can give it its own feed / speed
+        Entrance   // a CUTTING chain like None, but the FIRST ENGAGEMENT of its region:
+                   // executed while neither its parent nor all of its children are
+                   // already cut, so no cleared swath lies beside it and the tool meets
+                   // full-width material (a suspected full slot) -- a consumer should
+                   // take it slowly
     };
 
     struct Chain {

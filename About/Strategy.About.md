@@ -140,6 +140,7 @@ Beyond its geometry, every chain wears a semantic tag:
 | `LeadIn`  | a ramp easing *onto* a cut after a retract (the consumer descends it) |
 | `LeadOut` | the mirror: easing *off* a cut before the retract lifts |
 | `Finish`  | a cutting chain flagged as the thin finishing pass (own feed/speed) |
+| `Entrance`| a cutting chain making the *first engagement* of its region — a suspected full slot, to be taken slowly |
 
 The tags are semantic, not cosmetic: the CAM app decides retract heights and ramp
 descents from them; the Sketch app merely picks colours.
@@ -306,6 +307,19 @@ post-processing axes then apply, independent by design:
 This ordering stage is deliberately a seam: it decides *sequence*, and nothing else —
 smarter orderings slot in here without touching linking or leads.
 
+### Entrance tagging — the full-slot suspects
+
+Once the final execution order is fixed, each cutting chain is judged for *engagement*:
+a chain run while **neither its parent nor all of its children are already cut** has no
+cleared swath beside it — the tool meets full-width material, a suspected full slot —
+and is retagged `Entrance`. The rule is execution-order truth, not ancestry alone:
+outside-in it catches each region's wall ring; inside-out (`reverse`) the innermost
+leaf; a deferred outer (`emitOuter` off) leaves its child correctly suspect. Only
+*emitted* chains count as relief — an unemitted child cleared nothing — and a leaf with
+an uncut parent is always suspect (zero children never vacuously relieve). Degenerate
+sweeps are `Entrance` by definition. A consumer gives entrance chains their own slow
+feed, exactly as it does `Finish`.
+
 ### Linking — measured, never assumed
 
 Between consecutive cutting chains the strategy weaves connector chains, and the central
@@ -341,6 +355,10 @@ consumer will descend (`cuttingDepth / tan(plungeSlope)`), so the same chain dou
 a **helix ramp**: on an island too small for the run, the lead simply wraps the inset in
 whole laps. Lead-out runs its own, much steeper angle (`retractSlope`) — it climbs, it
 doesn't plunge.
+
+An **`Entrance`** target's lead-in gets one extra rule: its ramp descends into
+full-width material, so the run is floored at **one full lap** of the ring — the
+descent is spread around the whole loop, never plunged down a short arc.
 
 ### The witness-mark overshoot
 

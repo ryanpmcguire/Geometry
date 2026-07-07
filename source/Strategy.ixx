@@ -8,6 +8,7 @@ module;
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 export module Geo.Strategy;
@@ -363,6 +364,30 @@ export namespace Geo {
                 for (Chain& c : run) { c = c.reversed(); }
             }
 
+            // ENTRANCE tagging -- execution-order truth about engagement. A cutting
+            // chain run while NEITHER its parent NOR all of its children are already
+            // cut has no cleared swath beside it: the tool meets full-width material
+            // (a suspected full slot). Outside-in that is each region's wall ring;
+            // inside-out, the innermost leaf; a deferred outer (emitOuter off) leaves
+            // its child correctly suspect. Only EMITTED chains count as relief -- an
+            // unemitted child cleared nothing. A leaf with an uncut parent is always
+            // suspect (zero children never vacuously relieve).
+            {
+                std::unordered_map<Id, size_t> children;      // emitted children per id
+                for (const Chain& c : run) { children[c.parent]++; }
+
+                std::unordered_set<Id> cut;
+                std::unordered_map<Id, size_t> cutChildren;
+                for (Chain& c : run) {
+                    const auto kids = children.find(c.id);
+                    const bool parentCut   = cut.count(c.parent) > 0;
+                    const bool childrenCut = kids != children.end() && cutChildren[c.id] == kids->second;
+                    if (!parentCut && !childrenCut) { c.link = LinkKind::Entrance; }
+                    cut.insert(c.id);
+                    cutChildren[c.parent]++;
+                }
+            }
+
             // Does the straight hop a -> b cross any source chain geometry?
             auto crossesSource = [&](Pos a, Pos b) -> bool {
 
@@ -670,11 +695,20 @@ export namespace Geo {
                 }
 
                 // 2. Lead-IN to the target, built first so the link can deliver the
-                //    tool to where the lead-in begins (its inset, not the cut).
+                //    tool to where the lead-in begins (its inset, not the cut). An
+                //    ENTRANCE ring's ramp descends into full-width material, so its
+                //    run is floored at one full lap of the ring -- the descent is
+                //    spread around the whole loop, never plunged down a short arc.
                 std::optional<Chain> leadIn;
                 if (doLead) {
+                    float runLen = leadRun;
+                    if (next.link == LinkKind::Entrance) {
+                        float perim = 0.0f;
+                        for (const auto& e : next.edges) { perim += Chain::edgeLength(*e); }
+                        runLen = std::max(runLen, perim);
+                    }
                     Pos inStart;
-                    Chain li = buildLeadIn(next, entry, leadRun, inStart);
+                    Chain li = buildLeadIn(next, entry, runLen, inStart);
                     if (!li.edges.empty()) { linkTarget = inStart; leadIn = std::move(li); }
                 }
 
@@ -780,11 +814,13 @@ export namespace Geo {
                     for (const std::vector<const Stoicheion*>& wall : walls) {
 
                         // The blind inset: the sweep is the wall run carried one tool
-                        // radius into the region, gaps bridged straight.
+                        // radius into the region, gaps bridged straight. A sweep is by
+                        // definition a first engagement of uncut material: Entrance.
                         Chain sweep;
                         sweep.closed = false;
                         sweep.id = newId();
                         sweep.parent = c.id;
+                        sweep.link = LinkKind::Entrance;
                         for (const Stoicheion* e : wall) {
                             std::unique_ptr<Stoicheion> o = Chain::offsetLeft(*e, params.toolRadius);
                             if (Chain::edgeLength(*o) < 1e-4f) { continue; }
