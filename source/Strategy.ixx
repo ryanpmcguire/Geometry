@@ -44,6 +44,11 @@ export namespace Geo {
 
         StrategyKind kind = StrategyKind::Profile;
 
+        // HATCH only: the direction the raster strokes run, degrees CCW from +x.
+        // Scan lines advance perpendicular to it; 0 = strokes along +x (fewest
+        // reversals when the long axis of the region is +x).
+        float hatchAngle = 0.0f;
+
         float toolRadius = 1.0f;      // the boundary clearance: generation 1 offsets by exactly this
         float stepover = 1.0f;        // generation advance as a FRACTION of the tool radius
                                       // (gen 2+ offset by toolRadius * stepover; <= 2.0 for full
@@ -158,11 +163,13 @@ export namespace Geo {
             std::erase_if(seed.chains, [](const Chain& c) { return !c.closed; });
 
             // The strategy's own preparation: open-air edges pre-offset into the
-            // free region. The push must fund BOTH sides of generation 1's inset
-            // (a wall-backed sliver erodes by 2R) plus margin off the exact-
-            // tangency degeneracy -- hence past 2R, not the bare corner-coverage
-            // amount. Toolpathy logic -- it belongs here, not in the method.
-            if (params.kind == StrategyKind::Profile) {
+            // free region. For PROFILE the push funds BOTH sides of generation 1's
+            // inset (a wall-backed sliver erodes by 2R) plus margin off the exact-
+            // tangency degeneracy -- hence past 2R. For HATCH it is what lets the
+            // raster OVERRUN the open sides: the inset that follows brings walls in
+            // by a radius while the pushed-out air edges stay proud, so strokes
+            // begin and end in open air (no leads, no entries into material).
+            if (params.kind == StrategyKind::Profile || params.kind == StrategyKind::Hatch) {
                 for (Chain& c : seed.chains) {
                     c = c.withOpenAirOffset(params.toolRadius * 2.1f);
                 }
@@ -171,11 +178,16 @@ export namespace Geo {
             result.profiles.push_back(std::move(seed));
             seed = Profile();
 
-            if (params.kind == StrategyKind::Hatch) { hatchGenerations(); }
-            else                                    { profileGenerations(); }
-
-            buildSteps();
-            buildToolpath();
+            if (params.kind == StrategyKind::Hatch) {
+                hatchGenerations();
+                buildSteps();
+                buildHatchToolpath();
+            }
+            else {
+                profileGenerations();
+                buildSteps();
+                buildToolpath();
+            }
 
             return result;
         }
@@ -238,14 +250,147 @@ export namespace Geo {
             }
         }
 
-        // The HATCH strategy: placeholder -- one boundary generation, so the
-        // plumbing can be exercised end to end until the real hatch lands.
+        // The HATCH strategy is a bounded raster fill -- no generation series, just
+        // the tool-centre reachable region, filled with parallel strokes. This step
+        // resolves that region: the prepared seed inset by one tool radius (walls in
+        // by R, air edges left proud by the earlier open-air push, so strokes overrun
+        // the open sides). buildHatchToolpath scan-fills it.
         void hatchGenerations() {
 
             if (std::fabs(params.toolRadius) <= 1e-6f) { return; }
 
-            Profile boundary = result.profiles.front().offsetBy(params.toolRadius);
-            if (!boundary.empty()) { result.profiles.push_back(std::move(boundary)); }
+            Profile region = result.profiles.front().offsetBy(params.toolRadius);
+            if (!region.empty()) { result.profiles.push_back(std::move(region)); }
+        }
+
+        // The HATCH toolpath: sweep a scan line across the reachable region at the
+        // requested angle, spaced by the stepover; each scan line's transversal
+        // crossings pair into interior spans (even-odd), and each span is one stroke.
+        // Alternate lines flip so the tool serpentines (turns at the end) instead of
+        // returning -- the zig-zag that trades climb purity for half the travel, the
+        // correct roughing trade for air-bounded regions. Step-overs that stay over
+        // cleared floor are Cut links; a hop that crosses the boundary (a hole, a
+        // concavity) is a Retract. Straight strokes, so no leads: the region's own
+        // open-air overrun is the free lead-in. Post axis `reverse` flips the order;
+        // milling sense is the zig-zag itself (climb is a finishing-pass concern).
+        void buildHatchToolpath() {
+
+            result.toolpath.clear();
+            if (result.profiles.size() < 2) {
+                result.warnings.push_back(
+                    "The region collapsed under the tool radius -- it is narrower than the "
+                    "cutter, so nothing was hatched.");
+                return;
+            }
+
+            const Profile& region = result.profiles.back();   // the tool-centre reachable region
+
+            const float a = params.hatchAngle * 3.14159265358979f / 180.0f;
+            const Pos d(std::cos(a), std::sin(a));    // strokes run along d
+            const Pos p(-std::sin(a), std::cos(a));   // scan lines advance along p
+
+            // The clip edges, and the region's extent in the (d, p) hatch frame
+            std::vector<const Stoicheion*> clip;
+            float dMin = 1e30f, dMax = -1e30f, pMin = 1e30f, pMax = -1e30f;
+            for (const Chain& c : region.chains) {
+                if (c.edges.empty()) { continue; }
+                for (const auto& e : c.edges) { clip.push_back(e.get()); }
+                std::vector<Pos> pts; c.tessellate(pts);
+                for (const Pos& q : pts) {
+                    const float qd = q.dot(d), qp = q.dot(p);
+                    dMin = std::min(dMin, qd); dMax = std::max(dMax, qd);
+                    pMin = std::min(pMin, qp); pMax = std::max(pMax, qp);
+                }
+            }
+            if (clip.empty() || dMax <= dMin || pMax <= pMin) { return; }
+
+            const float spacing = std::max(params.toolRadius * std::max(0.05f, params.stepover), 1e-3f);
+            const float pad = spacing + 1.0f;
+
+            // Each scan line: intersect the region, pair interior spans into strokes
+            struct Stroke { Pos a, b; };
+            std::vector<std::vector<Stroke>> lines;
+
+            const int n = std::max(1, static_cast<int>(std::ceil((pMax - pMin) / spacing)));
+            for (int k = 0; k < n; k++) {
+
+                const float s = pMin + spacing * (static_cast<float>(k) + 0.5f);
+                if (s > pMax) { break; }
+
+                const Segment2 scan(d * (dMin - pad) + p * s, d * (dMax + pad) + p * s);
+
+                std::vector<float> ts;
+                for (const Stoicheion* e : clip) {
+                    std::vector<Pos> hits;
+                    Chain::edgeCross(scan, *e, hits);
+                    for (const Pos& h : hits) { ts.push_back(h.dot(d)); }
+                }
+                if (ts.size() < 2) { continue; }
+
+                std::sort(ts.begin(), ts.end());
+                std::vector<float> u;   // dedupe coincident crossings (a shared vertex hit twice)
+                for (float t : ts) { if (u.empty() || t - u.back() > 1e-4f) { u.push_back(t); } }
+
+                std::vector<Stroke> strokes;
+                for (std::size_t i = 0; i + 1 < u.size(); i += 2) {
+                    strokes.push_back({ d * u[i] + p * s, d * u[i + 1] + p * s });
+                }
+                if (!strokes.empty()) { lines.push_back(std::move(strokes)); }
+            }
+
+            if (lines.empty()) {
+                result.warnings.push_back(
+                    "No hatch strokes fit the region at this stepover -- it is narrower than a "
+                    "single pass.");
+                return;
+            }
+            if (params.reverse) { std::reverse(lines.begin(), lines.end()); }
+
+            // Does the straight hop a -> b cross the region boundary (=> a retract)?
+            auto crosses = [&](Pos from, Pos to) -> bool {
+                if ((to - from).pythag() <= 1e-4f) { return false; }
+                const Segment2 hop(from, to);
+                for (const Stoicheion* e : clip) {
+                    std::vector<Pos> hits; Chain::edgeCross(hop, *e, hits);
+                    if (!hits.empty()) { return true; }
+                }
+                return false;
+            };
+
+            // A stay-down (Cut) link is only safe over the just-cleared swath: the hop
+            // must be SHORT (within a stepover-plus-radius of the last cut) AND cross no
+            // wall. This is the profile strategy's reach+clearance rule, mirrored -- a
+            // longer in-region hop would slot full-width at depth, so it retracts.
+            const float stayBudget = spacing + params.toolRadius;
+
+            bool haveCursor = false;
+            Pos cursor;
+            for (std::size_t li = 0; li < lines.size(); li++) {
+
+                std::vector<Stroke>& strokes = lines[li];
+                if (li % 2 == 1) {   // serpentine: reverse this line's strokes end-for-end
+                    std::reverse(strokes.begin(), strokes.end());
+                    for (Stroke& st : strokes) { std::swap(st.a, st.b); }
+                }
+
+                for (Stroke& st : strokes) {
+
+                    if (haveCursor && (st.a - cursor).pythag() > 1e-4f) {
+                        const bool stayDown =
+                            (st.a - cursor).pythag() <= stayBudget && !crosses(cursor, st.a);
+                        Chain link; link.closed = false; link.id = newId();
+                        link.link = stayDown ? LinkKind::Cut : LinkKind::Retract;
+                        link.edges.push_back(std::make_unique<Segment2>(cursor, st.a));
+                        result.toolpath.push_back(std::move(link));
+                    }
+
+                    Chain cut; cut.closed = false; cut.id = newId(); cut.link = LinkKind::None;
+                    cut.edges.push_back(std::make_unique<Segment2>(st.a, st.b));
+                    result.toolpath.push_back(std::move(cut));
+
+                    cursor = st.b; haveCursor = true;
+                }
+            }
         }
 
         // Per-generation stats and the FINAL SANITY RULE: a step whose total
