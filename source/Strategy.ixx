@@ -391,6 +391,33 @@ export namespace Geo {
                     cursor = st.b; haveCursor = true;
                 }
             }
+
+            // the inset region boundary is itself a real toolpath line: the tool
+            // centre riding it lands the cutting edge on the finished walls. the
+            // centred raster stops half a stepover short of it, so trace the
+            // boundary LAST as a half-feed entrance ring -- the finisher that
+            // brings every walled side to size. same link rule as a raster hop:
+            // a short in-region step stays down, otherwise it retracts on.
+            for (const Chain& c : region.chains) {
+                if (c.edges.empty()) { continue; }
+
+                const Pos start = Chain::eStart(*c.edges.front());
+
+                if (haveCursor && (start - cursor).pythag() > 1e-4f) {
+                    const bool stayDown =
+                        (start - cursor).pythag() <= stayBudget && !crosses(cursor, start);
+                    Chain link; link.closed = false; link.id = newId();
+                    link.link = stayDown ? LinkKind::Cut : LinkKind::Retract;
+                    link.edges.push_back(std::make_unique<Segment2>(cursor, start));
+                    result.toolpath.push_back(std::move(link));
+                }
+
+                Chain perim = c.clone();
+                perim.link = LinkKind::Entrance;
+                result.toolpath.push_back(std::move(perim));
+
+                cursor = start; haveCursor = true;   // a closed loop returns to its start
+            }
         }
 
         // Per-generation stats and the FINAL SANITY RULE: a step whose total
