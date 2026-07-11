@@ -153,20 +153,30 @@ survives as the standoff around the pillar, exactly as the perimeter did around 
 cut's island copy is scaffolding. Nesting depth alone decided every handedness, and the seed stands
 `R` off *both* walls.
 
-## The load-bearing dependency (read before trusting this)
+## The load-bearing dependency (history: it bit, and how)
 
-There is one honest catch, and it ties this document back to [03](03-The-Frontier.md). **Both
-dilations are growing offsets — `σ = −1` for cut and for avoid alike.** The entire seed construction
-lives in the `σ < 0` regime. And a growing chain that self-intersects (dilate any non-convex cut or
-avoid loop until a concavity closes) is precisely the single-chain case that document 03 flags as
-**unproven**: the current `minLevel` extraction was only ever validated for `σ > 0` (shrinking), and
-almost certainly extracts the wrong extreme for `σ < 0`.
+This section originally warned that the seed lives in the growing direction and rested on an
+unverified frontier-selection rule. **The warning was earned**: on real parts, avoid boundaries
+with features at scale ≲ R (fillets, notches — whose *grown* offsets self-cross) came back
+mangled, and the avoid failed to bound the cut — tool-radius-dependent, apparently at random.
+The root cause was the selection rule itself: an earlier revision keyed the extreme on the sense
+`σ`, which a mirror argument forbids (see the corrected [03](03-The-Frontier.md)). The seed's
+four chain classes make the distinction vivid — all four are dilations, but they sit on **both
+sides** of the corrected rule:
 
-So the seed is only as sound as the `σ < 0` self-mitosis it rests on. This construction **cannot be
-wired onto the existing extraction as-is** — it would exercise, on real parts, exactly the growing-
-self-intersection case the old code never answered. The `σ < 0` extreme (and its normalisation
-anchor) must be pinned by known-answer fixture *first*; the seed is the caller that makes that
-fixture non-optional.
+| chain | h | amount | extreme |
+|---|---|---|---|
+| fill outers  | CCW | `−(R+δ)` | maximum |
+| fill islands | CW  | `−(R+δ)` | maximum |
+| avoid outers  | CW  | `+R` | minimum |
+| avoid islands | CCW | `+R` | minimum |
+
+One system offsets leftward, the other rightward — `sign(amount)` splits them cleanly, `σ` does
+not (it calls all four "growing" except the islands, and mislabels two). The avoid outers — the
+very chains that bound the cut — were among the mislabeled. The lesson for any reimplementation:
+**selection is a label question (`sign(amount)`); shrink-vs-grow and the inversion guard are
+region questions (`σ`); the seed construction is the caller that exercises all four quadrants at
+once, and is therefore the acceptance test for getting the two keys straight.**
 
 ## Carried across to the reconstruction
 
@@ -187,10 +197,26 @@ fixture non-optional.
 - **A shared wall grows to two copies, and that is the mechanism, not waste.** The avoid's copy wins
   at kept walls (standoff `−R`); the cut's copy survives where no avoid backs it (air overrun `+R`).
   Wall-standoff and air-overrun come from one construction with no per-edge boolean.
-- **This whole construction is `σ < 0`.** It depends entirely on the growing-direction self-mitosis
-  of [03](03-The-Frontier.md), which is the reconstruction's first and highest-priority fixture. Do
-  not let a real part ride on it until that is measured, not assumed.
-- Degeneracies to fixture: cut and avoid sharing a wall (their dilations overlap in a `2R` band —
-  lean on transversal-kiss rejection so the coincident boundary does not manufacture false
-  crossings); deep nesting parity; and an avoid that does not reach this slice at all (no avoid
-  loops → the seed is the lone dilated cut, the fully-open extent).
+- **The construction exercises all four `(h, sign(amount))` quadrants at once**, and its early
+  failures were the selection rule mis-keyed on `σ` — see the dependency section above. Selection
+  keys on `sign(amount)`; `σ` keys the guard. The two must never be re-fused.
+- Degeneracies to fixture: deep nesting parity; and an avoid that does not reach this slice at all
+  (no avoid loops → the seed is the lone dilated cut, the fully-open extent).
+- **Coincident dilations are a real, observed failure — break the symmetry by construction.** When a
+  fill boundary lies a whole multiple of `R` from an avoid boundary (tool-radius-dependent, so it
+  strikes apparently at random per tool), the two grown copies share **long coincident stretches**,
+  and the merge shreds: near-parallel intersection kernels return noise, winding probes land *on*
+  the partner curve (the one place the subtended-angle sum is singular), and the frontier test
+  coin-flips piece by piece. Transversal-kiss rejection alone does not survive this. The remedy is
+  **generic position with a safe-direction bias**: grow the fill by `R + δ` and the avoid by
+  **exactly `R`**. The asymmetry is principled, not a fudge — the avoid inflation is the *safety
+  bound* (dimensional truth, never biased), while the fill expansion is only a *reach claim*, and
+  over-claiming reach is harmless: the claim is still clipped by the exact avoid term, and the extra
+  `δ` of overrun hangs in open air where the outermost ring is the zero-engagement bound anyway
+  (coverage is the inlay's job, and ring overlap absorbs `δ` entirely). `δ` is **absolute** (the
+  kernel tolerances and section slop are absolute), comfortably above both — ~5e-2 model units.
+  **The invariant: only the minuend may be greedy; the subtrahend is never biased below `R`.**
+  Residual (rarer) case a fill bias cannot separate: two *same-role* boundaries whose dilations
+  coincide (e.g. a slot exactly `2R` wide — the two avoid copies meet mid-slot). If observed, the
+  same principle extends: stagger same-role loops by tiny *upward* increments (over-avoidance is
+  the safe direction — it leaves material, never gouges). Not implemented until needed.

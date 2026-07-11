@@ -36,55 +36,63 @@ Two properties of this field matter for what follows:
   and — this is the trap — the current code anchors on the maximum because it only ever needed the
   minimum. See below.
 
-## Which extreme: the sense decides
+## Which extreme: the side decides
 
-The true frontier is the level-set at an **extreme** of the field — but *which* extreme, minimum
-or maximum, is not fixed. It is set by the offset's **sense** relative to the chain's handedness,
-`σ = sign(amount · h)` — the same scalar that decides shrink-versus-grow in
-[02-Offsetting-Semantics.md](02-Offsetting-Semantics.md):
+*(Corrected 2026-07-11. An earlier revision of this section claimed the extreme was selected by
+the sense `σ = sign(amount · h)`. That is impossible, and the error surfaced in production as
+avoid boundaries failing to bound. The record of why is kept below, because the argument is the
+lesson.)*
 
-- When the chain's own region **shrinks** (`σ > 0` — a CCW inset, or a CW island being inset), the
-  true frontier is driven to the **deep** end of the field. The excursion loops sit *outside* it,
-  at shallower levels. The frontier is the **minimum** level.
-- When the chain's own region **grows** (`σ < 0` — a CCW outset, or a CW island being grown), the
-  true frontier is the **outer envelope**. The excursions now sit *inside* it. The frontier is the
-  **opposite** extreme.
+The true frontier is the level-set at an **extreme** of the field — and which extreme is set by
+**`sign(amount)` alone**: the *side* the curve was displaced, in the same travel-left orientation
+the field itself is built from.
 
-The intuition is direct: shrinking buries the real boundary at the bottom of the tangle and throws
-the debris outward; growing pushes the real boundary to the outer rim and traps the debris inside.
-The field's orientation flips with handedness *and* the "which extreme is real" flips with offset
-direction — and because both effects are already fused into `σ`, **the single scalar `σ` selects
-the extreme.** This is why the method can do minimum *or* maximum winding analysis and get the
-right frontier either way: it is not two algorithms, it is one algorithm reading one sign.
+- **Leftward offset (`amount > 0`)** — the frontier is the **minimum** level.
+- **Rightward offset (`amount < 0`)** — the frontier is the **maximum** level.
 
-> This corrects an earlier, looser statement that the selection was handedness-*invariant* and
-> keyed on `sign(amount)` alone. It is not. It keys on `sign(amount · h)`. The two happen to
-> coincide for CCW chains, which is why the confusion was easy — and why the CW case is where it
-> would silently go wrong.
+**Why it cannot key on `σ`: the mirror argument.** Reflect the plane. A CCW chain inset by `+a`
+(the production-proven case, frontier at the minimum) becomes a CW chain offset by `−a` — same
+geometry, same true frontier fragments. But every increment in the walk is a 2D cross product,
+and cross products **negate under reflection**: the whole level field negates, so the fragments
+that sat at the minimum now sit at the maximum. `σ` is mirror-invariant (`(−a)·(−h) = a·h`), yet
+the correct extreme label flipped. No rule reading `σ` alone can be right. `sign(amount)` flips
+under the mirror exactly as the label does.
 
-## What the current code actually proves — and does not
+**The evidence anchors, one per side.** Leftward-min is proven by the entire legacy engine (every
+chain, CCW outers and CW islands alike, offset at `amount > 0` and extracted at the minimum, in
+production for months). Rightward-max is proven by the crescent-sliver seed on a real part: a CCW
+fill grown (`amount < 0`) through its own tangency cusps — a genuinely self-intersecting raw
+offset — extracted the correct envelope at the maximum.
 
-The existing extraction takes the **minimum** level, unconditionally, and it is correct — for the
-cases it runs. Those cases are all `σ > 0`: the recursion only ever insets (positive amount), so
-CCW outers shrink (`σ > 0`, minimum, correct) and CW islands, at that same positive amount, *grow*
-(`σ < 0`) — but a *growing convex-ish island does not self-intersect*, so its field is flat, its
-minimum equals its maximum, and taking the minimum happens to be right by vacuity.
+The earlier intuition ("shrinking buries the real boundary at the deep end; growing pushes it to
+the rim") remains true *geometrically* — but "deep end" is a fact about the plane, while
+minimum-vs-maximum is a fact about the field's *labels*, and the labels flip with travel
+direction. `σ` captures the geometry; `sign(amount)` captures the labels; selection needs the
+labels. The sense `σ` still governs everything that is genuinely a *region* question — shrink
+versus grow, and the inversion guard below.
 
-The gap is exact and worth stating plainly:
+## What the evidence actually covers — and does not
 
-> **A growing chain that genuinely self-intersects — a CW island with a concavity, grown until the
-> concavity closes on itself; equivalently a CCW chain outset until a neck pinches — is the case
-> `σ < 0` with a non-flat field. The current uniform-minimum rule extracts the wrong extreme
-> there. It has never been caught because that case does not arise in the tested corpus.**
+The legacy extraction takes the **minimum** level, unconditionally, and every chain it ever ran —
+CCW outers shrinking *and* CW islands growing — was offset at `amount > 0`. Under the corrected
+rule that is not a coincidence it survived; it is the rule: **leftward → minimum**, regardless of
+handedness, regardless of shrink-or-grow. The legacy engine is a months-long production proof of
+the left half of the rule.
 
-This is not a hypothetical for the reconstruction: the whole reason the reconstruction exists —
-the outward-offset seed construction — deliberately drives chains in the `σ < 0` direction. So:
+The right half (`amount < 0` → maximum) is anchored by the crescent-sliver seed: a CCW fill grown
+through its own tangency cusps — a genuinely self-crossing raw offset — extracting the correct
+outer envelope at the maximum, verified on a real part.
 
-- **Fixture obligation.** Construct a self-intersecting *growing* chain with a known answer (a "U"
-  or dumbbell outset until the arms cross; a concave CW island grown until it closes). Confirm the
-  extreme that recovers the true envelope, and confirm the normalisation anchor flips with `σ`
-  rather than being hard-anchored to the maximum. This is a *measured* result, written as a
-  known-answer test — never derived on paper and trusted.
+The remaining under-evidenced corner: a **CW chain at `amount > 0` whose growth self-crosses**
+(a keep-island with a concavity tighter than the offset). The rule says minimum; the legacy
+engine agrees but ran that case mostly on flat fields (small stepovers rarely self-cross), so the
+evidence is thin rather than absent.
+
+- **Fixture obligation.** Construct the thin-corner case with a known answer (a concave CW island
+  grown until the concavity closes; the mirror "U" outset as its CCW twin). Confirm the extremes
+  match `sign(amount)` on both, and that the max-anchored normalisation is label-consistent. A
+  *measured* result, written as a known-answer test — the mirror argument constrains the answer,
+  but the fixture is what earns it.
 
 ## The inversion law for a single chain
 
@@ -112,11 +120,14 @@ handedness flipped."
 
 - Extraction is: build the crossing-number field by a travel-ordered walk, take the frontier at an
   **extreme** level-set, apply the inversion guard.
-- The extreme (min vs max) and the normalisation anchor are chosen by the **sense** `σ =
-  sign(amount · h)`, not by `sign(amount)` and not by handedness alone.
+- The extreme is chosen by **`sign(amount)`** — leftward → minimum, rightward → maximum. It cannot
+  key on `σ` (the mirror argument above) and it cannot key on handedness alone.
 - The inversion guard fires only when `σ > 0` (shrinking); it discards handedness-flipped children.
-- `σ > 0` reproduces today's behaviour exactly. `σ < 0` with a self-intersecting field is
-  **unproven** in the current code and is a known-answer fixture, not a derivation.
+  Selection and the guard read **different variables** — conflating them was the original
+  hard-coding, and mis-fusing them into `σ` was the reconstruction's one real error.
+- Anchors: leftward-min (legacy engine, production), rightward-max (the crescent seed, real part).
+  The least-evidenced corner is a **CW chain at `amount > 0` whose growth self-crosses** (min per
+  the rule; legacy ran it mostly vacuously) — still worth a dedicated known-answer fixture.
 - Preserve the numerical scar tissue verbatim: crossings computed in **double precision**;
   tangent-seam **fusion**; **small-feature pruning**; interiority measured in **absolute distance**
   (never a parameter tolerance, which scales with edge length); and **transversal-kiss rejection**

@@ -41,13 +41,16 @@ export import Geo.Chain;
 // sharing them means a differential test against the old kernel compares
 // the METHOD, not two transcriptions of the same arithmetic.
 //
-// UNVERIFIED BY THE ORACLE (fixture obligations, Method/03 and 06):
-//   * sigma < 0 (growing) selection takes the MAXIMUM level. The old code
-//     never grew a self-intersecting chain, so this is per-spec but not
-//     yet pinned by a known-answer fixture.
-//   * a growing chain's legitimate secondary births (a pinched-off void
-//     between two arms) are currently dropped -- only the extreme level
-//     is kept. Known limitation; affects efficiency, not safety.
+// SELECTION RULE (corrected 2026-07-11; see offsetValid): the frontier
+// extreme keys on sign(amount) -- the side the curve was pushed -- NOT on
+// sigma. A mirror argument forbids sigma-keyed selection (reflection
+// preserves sigma but negates the level field); production anchors pin
+// both halves (legacy engine: min at amount > 0; the crescent seed: max
+// at amount < 0). Sigma gates only the inversion guard.
+//
+// KNOWN LIMITATION: a growing chain's legitimate secondary births (a
+// pinched-off void between two arms) are dropped with the non-extreme
+// levels. Affects efficiency, not safety.
 // =====================================================================
 export namespace Geo::Frontier {
 
@@ -561,21 +564,26 @@ export namespace Geo::Frontier {
     }
 
     // The method end to end for ONE chain: blind offset, crossing field,
-    // sigma-keyed extreme, oriented stitch, sigma-gated inversion guard.
+    // side-keyed extreme, oriented stitch, sigma-gated inversion guard.
     //
-    //   sigma = sign(amount * h):
-    //     > 0  the chain's own region SHRINKS. The true frontier is driven to
-    //          the deep end of the field (minimum level), and only a shrinking
-    //          chain can collapse through zero -- so the inversion guard is on:
-    //          closed children whose turning flipped against the source are
-    //          the fold, not a boundary, and are discarded.
-    //     < 0  the chain's own region GROWS. The true frontier is the outer
-    //          envelope (maximum level -- 0 after normalisation), excursions
-    //          trapped inside; growth cannot invert, so the guard is off.
-    //          [Per Method/03 this branch is spec-correct but NOT yet pinned
-    //          by the growing-self-intersection fixture. Secondary births (a
-    //          void pinched off between growing arms) are dropped with the
-    //          non-extreme levels: a known, safe-direction limitation.]
+    // TWO different keys, and they are not the same variable:
+    //
+    //   * The EXTREME is keyed on sign(amount) -- the SIDE the curve was
+    //     pushed, matching the field's own travel-left orientation. Leftward
+    //     (amount > 0): the frontier is the MINIMUM level. Rightward
+    //     (amount < 0): the MAXIMUM. It cannot key on sigma: mirror the plane
+    //     and a proven min-case becomes its opposite-handed twin with every
+    //     crossing increment negated -- same sigma, opposite extreme label.
+    //     Anchors: the legacy engine (all chains at amount > 0, min, proven
+    //     in production, CW-growing islands included) and the crescent seed
+    //     (CCW growing at amount < 0, max, verified on a real part).
+    //
+    //   * The GUARD is keyed on sigma = sign(amount * h) -- a REGION question:
+    //     only a shrinking chain (sigma > 0) can collapse through zero, so only
+    //     there are handedness-flipped children the fold rather than a boundary.
+    //     Growth (sigma < 0) cannot invert; the guard is off. [Growing secondary
+    //     births -- a void pinched off between growing arms -- are still dropped
+    //     with the non-extreme levels: a known, safe-direction limitation.]
     //
     // h is judged by exact signed AREA (the sense is a region question);
     // the guard compares TURNING (offsetting preserves tangent structure, so
@@ -600,7 +608,7 @@ export namespace Geo::Frontier {
 
         int lo = frags.front().level, hi = frags.front().level;
         for (const Fragment& f : frags) { lo = std::min(lo, f.level); hi = std::max(hi, f.level); }
-        const int target = (sigma > 0.0f) ? lo : hi;
+        const int target = (amount > 0.0f) ? lo : hi;   // the SIDE, not sigma (see above)
 
         std::vector<std::unique_ptr<Stoicheion>> pool;
         for (Fragment& f : frags) {
@@ -840,6 +848,21 @@ export namespace Geo::Frontier {
             float eps = 1e-3f;            // endpoint-coincidence tolerance
             float weldEps = 1e-2f;        // almost-closed loops within this gap are welded shut
                                           // (BRep-section endpoints carry approximation slop)
+
+            // Generic-position symmetry breaker. The fill is grown by R + fillBias
+            // while the avoid is grown by EXACTLY R -- so grown boundaries that
+            // would otherwise lie coincident for long stretches (a feature wall a
+            // whole multiple of R from a kept wall -- tool-radius-dependent, so it
+            // strikes "randomly" per tool) are separated in guaranteed transversal
+            // position, beyond every kernel tolerance and the section slop.
+            //
+            // The asymmetry is the principle, not a fudge: the avoid inflation is
+            // the SAFETY BOUND (dimensional truth, exactly R -- never biased), while
+            // the fill expansion is only a REACH CLAIM, and over-claiming reach is
+            // harmless -- the claim is still clipped by the exact avoid term, and
+            // the extra overrun hangs in open air. Greed on the minuend is free;
+            // the subtrahend must stay exact.
+            float fillBias = 0.05f;       // model units (absolute: kernel tolerances are absolute)
         };
 
         Params params;
@@ -855,6 +878,17 @@ export namespace Geo::Frontier {
         // deeper. Warnings are plain-language deviations, empty on a clean run.
         std::vector<Profile> profiles;
         std::vector<std::string> warnings;
+
+        // The oriented, welded FILL section (material boundary at this slice),
+        // kept after run() for consumers: winding >= 1 against these chains is
+        // material, below is open air -- the test that decides where a ring may
+        // be entered by a straight plunge (the tool centre column hangs in air).
+        std::vector<Chain> fillBoundary;
+
+        // The oriented, welded AVOID section, likewise kept -- primarily so a
+        // consumer can SEE what actually bounded the seed (an empty list on a
+        // level with kept material is the tell that the avoid never arrived).
+        std::vector<Chain> avoidBoundary;
 
         void ingest(std::vector<std::unique_ptr<Stoicheion>> fillSet,
                     std::vector<std::unique_ptr<Stoicheion>> avoidSet) {
@@ -904,6 +938,8 @@ export namespace Geo::Frontier {
 
             profiles.clear();
             warnings.clear();
+            fillBoundary.clear();
+            avoidBoundary.clear();
 
             const float R = params.toolRadius;
             if (R <= 1e-6f) { warnings.push_back("Tool radius is zero: nothing to construct."); return false; }
@@ -956,14 +992,21 @@ export namespace Geo::Frontier {
             // is the interior, so -R expands); avoid by +R (left of CW travel
             // is the exterior, so +R expands). Islands of each system shrink
             // under the same value -- dilation of the region, by one blind
-            // sign per system (Method/06).
+            // sign per system (Method/06). The fill takes the extra fillBias
+            // (see Params): reach is claimed greedily, the safety bound stays
+            // exact, and grown boundaries never sit coincident.
             std::vector<Chain> grown;
             for (Chain& c : fills) {
-                for (Chain& m : c.offsetValid(-R, params.eps)) { grown.push_back(std::move(m)); }
+                for (Chain& m : c.offsetValid(-(R + params.fillBias), params.eps)) { grown.push_back(std::move(m)); }
             }
             for (Chain& c : avoids) {
                 for (Chain& m : c.offsetValid(+R, params.eps)) { grown.push_back(std::move(m)); }
             }
+
+            // The sections have served the growth; keep them as the consumer's
+            // oracles (fillBoundary: material vs air; avoidBoundary: what bounded).
+            fillBoundary = std::move(fills);
+            avoidBoundary = std::move(avoids);
 
             // 4. The seed: one merge. { winding >= 1 } with roles is exactly
             // (fill (+) R) \ (avoid (+) R). Envelopment-without-intersection
