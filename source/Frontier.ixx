@@ -849,6 +849,16 @@ export namespace Geo::Frontier {
             float weldEps = 1e-2f;        // almost-closed loops within this gap are welded shut
                                           // (BRep-section endpoints carry approximation slop)
 
+            // The extended (lead) region's two expansions, as FRACTIONS of the
+            // tool radius. The survey of the open air lead motion may actually
+            // use: fill grown by a full diameter (centres within feasible reach
+            // of the cut), avoid grown PAST the ring standoff -- rings graze
+            // avoid + R, but approach moves keep an extra half radius off kept
+            // walls (over-avoidance is the safe direction; the seed's exact-R
+            // bound is untouched). leadReach = 0 disables the construction.
+            float leadReach = 2.0f;   // extended fill expansion
+            float leadClear = 1.5f;   // extended avoid expansion (never below 1.0)
+
             // Generic-position symmetry breaker. The fill is grown by R + fillBias
             // while the avoid is grown by EXACTLY R -- so grown boundaries that
             // would otherwise lie coincident for long stretches (a feature wall a
@@ -889,6 +899,19 @@ export namespace Geo::Frontier {
         // consumer can SEE what actually bounded the seed (an empty list on a
         // level with kept material is the tell that the avoid never arrived).
         std::vector<Chain> avoidBoundary;
+
+        // The grown systems, preserved pre-merge (the merge consumes its
+        // inputs): the per-chain offsetValid results of fill and avoid.
+        std::vector<Chain> grownFill;
+        std::vector<Chain> grownAvoid;
+
+        // The EXTENDED region: (fill (+) leadReach*R) minus (avoid (+) leadClear*R)
+        // -- the survey of the open air lead motion may actually use, built by
+        // the seed's own construction on the same preserved originals. Membership
+        // is a wall-safety certificate WITH MARGIN: a lead arc lying wholly
+        // inside it stays within feasible reach of the cut and keeps an extra
+        // half radius off every kept wall (rings graze avoid + R; leads don't).
+        Profile extended;
 
         void ingest(std::vector<std::unique_ptr<Stoicheion>> fillSet,
                     std::vector<std::unique_ptr<Stoicheion>> avoidSet) {
@@ -940,6 +963,9 @@ export namespace Geo::Frontier {
             warnings.clear();
             fillBoundary.clear();
             avoidBoundary.clear();
+            grownFill.clear();
+            grownAvoid.clear();
+            extended = Profile();
 
             const float R = params.toolRadius;
             if (R <= 1e-6f) { warnings.push_back("Tool radius is zero: nothing to construct."); return false; }
@@ -997,10 +1023,16 @@ export namespace Geo::Frontier {
             // exact, and grown boundaries never sit coincident.
             std::vector<Chain> grown;
             for (Chain& c : fills) {
-                for (Chain& m : c.offsetValid(-(R + params.fillBias), params.eps)) { grown.push_back(std::move(m)); }
+                for (Chain& m : c.offsetValid(-(R + params.fillBias), params.eps)) {
+                    grownFill.push_back(m.clone());     // preserved: the merge consumes its input
+                    grown.push_back(std::move(m));
+                }
             }
             for (Chain& c : avoids) {
-                for (Chain& m : c.offsetValid(+R, params.eps)) { grown.push_back(std::move(m)); }
+                for (Chain& m : c.offsetValid(+R, params.eps)) {
+                    grownAvoid.push_back(m.clone());
+                    grown.push_back(std::move(m));
+                }
             }
 
             // The sections have served the growth; keep them as the consumer's
@@ -1024,6 +1056,24 @@ export namespace Geo::Frontier {
                 warnings.push_back("No seed: the avoid region leaves no reachable extent of the fill "
                                    "(or the fill collapsed under the tool radius).");
                 return false;
+            }
+
+            // The extended region: the identical construction from the same
+            // preserved originals, at the lead expansions (see Params). The
+            // fill side carries the bias (generic position, greed is free);
+            // the avoid side is a clean 1.5R -- above R is the safe direction.
+            if (params.leadReach > 1e-4f) {
+                const float extF = params.leadReach * R + params.fillBias;
+                const float extA = std::max(1.0f, params.leadClear) * R;
+                std::vector<Chain> g2;
+                for (const Chain& c : fillBoundary) {
+                    for (Chain& m : c.offsetValid(-extF, params.eps)) { g2.push_back(std::move(m)); }
+                }
+                for (const Chain& c : avoidBoundary) {
+                    for (Chain& m : c.offsetValid(+extA, params.eps)) { g2.push_back(std::move(m)); }
+                }
+                extended.chains = Chain::merge(std::move(g2), params.eps);
+                for (Chain& c : extended.chains) { c.role = Role::Minuend; }
             }
 
             profiles.push_back(std::move(seed));
