@@ -5,6 +5,7 @@ module;
 #include <string>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <algorithm>
 
 export module Geo.Frontier;
@@ -75,6 +76,10 @@ export namespace Geo::Frontier {
         Id id = 0;
         Id parent = 0;
         Role role = Role::Minuend;
+
+        // An offset arc whose radius lands below this is a collapsed feature (a
+        // fillet at the offset distance, within numerical slop): culled outright
+        static constexpr float RadiusCull = 1e-2f;
 
         Chain() = default;
         Chain(Chain&&) = default;
@@ -263,6 +268,7 @@ export namespace Geo::Frontier {
             if (edges.size() == 1 && Kern::isCircle(*edges.front())) {
                 std::unique_ptr<Stoicheion> o = Kern::offsetLeft(*edges.front(), amount);
                 if (Kern::pruneSmallFeatures && Kern::edgeLength(*o) < Kern::PruneLength) { return result; }
+                if (Kern::asCirc(*o)->radius() < RadiusCull) { return result; }   // driven to (near) zero: extinct
                 result.edges.push_back(std::move(o));
                 return result;
             }
@@ -297,6 +303,16 @@ export namespace Geo::Frontier {
             for (size_t i = 0; i < edges.size(); i++) {
                 std::unique_ptr<Stoicheion> o = Kern::offsetLeft(*edges[i], amount);
                 if (Kern::pruneSmallFeatures && Kern::edgeLength(*o) < Kern::PruneLength) { continue; }
+
+                // An arc driven to (near) zero radius is a collapsed feature, not a
+                // boundary. The length prune alone misses it: through-zero inversion
+                // keeps the through-point's bearing, so the junk re-emerges with the
+                // COMPLEMENT sweep -- long enough to survive, chirality flipped. At
+                // fillet-radius == tool-radius (with section slop) this is the
+                // EXPECTED case, not the corner: cull by RADIUS, outright, and let
+                // the corner construction join the neighbours directly.
+                if (Kern::isArc(*o) && Kern::asArc(*o)->radius() < RadiusCull) { continue; }
+
                 off.push_back(std::move(o));
                 src.push_back(i);
             }
@@ -784,12 +800,20 @@ export namespace Geo::Frontier {
 
         std::vector<Chain> chains;
 
+        // The sanity verdict: a generation whose total signed area goes negative
+        // claims an unbounded region (transient garbage -- e.g. a surviving
+        // inverted burr). It is recorded and SKIPPED by consumers, never emitted
+        // -- and it never halts the ladder: recursion continues and the garbage
+        // extinctifies on its own (the legacy engine's concession, kept).
+        bool included = true;
+
         Profile() = default;
         Profile(Profile&&) = default;
         Profile& operator=(Profile&&) = default;
 
         Profile clone() const {
             Profile p;
+            p.included = included;
             for (const Chain& c : chains) { p.chains.push_back(c.clone()); }
             return p;
         }
@@ -813,6 +837,91 @@ export namespace Geo::Frontier {
             return next;
         }
     };
+
+    // =================================================================
+    // Raster -- parallel strokes filling a region (normally the SEED: the
+    // legal tool-centre region, so clipped strokes are safe by construction).
+    // Each scan line's transversal crossings pair into interior spans by
+    // even-odd; strokes come back OPEN, ordered and DIRECTED: `serpentine`
+    // reverses alternate lines end-for-end (hatch -- turns at the ends);
+    // without it every stroke runs the same way (scallop -- constant
+    // engagement sense, the consumer retracts between strokes). Links,
+    // retracts and Z are the consumer's grammar, never woven here.
+    // =================================================================
+    inline std::vector<Chain> raster(const Profile& region, float angleDeg, float spacing,
+                                     bool serpentine) {
+
+        std::vector<Chain> out;
+
+        const float ang = angleDeg * (TAU / 360.0f);
+        const Pos d(std::cos(ang), std::sin(ang));    // strokes run along d
+        const Pos p(-std::sin(ang), std::cos(ang));   // scan lines advance along p
+
+        // The clip edges and the region's extent in the (d, p) frame
+        std::vector<const Stoicheion*> clip;
+        float dMin = 1e30f, dMax = -1e30f, pMin = 1e30f, pMax = -1e30f;
+        for (const Chain& c : region.chains) {
+            if (c.edges.empty()) { continue; }
+            for (const auto& e : c.edges) { clip.push_back(e.get()); }
+            std::vector<Pos> pts;
+            c.tessellate(pts);
+            for (const Pos& q : pts) {
+                const float qd = q.dot(d), qp = q.dot(p);
+                dMin = std::min(dMin, qd); dMax = std::max(dMax, qd);
+                pMin = std::min(pMin, qp); pMax = std::max(pMax, qp);
+            }
+        }
+        if (clip.empty() || dMax <= dMin || pMax <= pMin) { return out; }
+
+        spacing = std::max(spacing, 1e-3f);
+        const float pad = spacing + 1.0f;
+
+        struct Stroke { Pos a, b; };
+        std::vector<std::vector<Stroke>> lines;
+
+        const int n = std::max(1, static_cast<int>(std::ceil((pMax - pMin) / spacing)));
+        for (int k = 0; k < n; k++) {
+
+            const float s = pMin + spacing * (static_cast<float>(k) + 0.5f);
+            if (s > pMax) { break; }
+
+            const Segment2 scan(d * (dMin - pad) + p * s, d * (dMax + pad) + p * s);
+
+            std::vector<float> ts;
+            for (const Stoicheion* e : clip) {
+                std::vector<Pos> hits;
+                Kern::edgeCross(scan, *e, hits);
+                for (const Pos& h : hits) { ts.push_back(h.dot(d)); }
+            }
+            if (ts.size() < 2) { continue; }
+
+            std::sort(ts.begin(), ts.end());
+            std::vector<float> u;   // dedupe coincident crossings (a shared vertex hit twice)
+            for (float t : ts) { if (u.empty() || t - u.back() > 1e-4f) { u.push_back(t); } }
+
+            std::vector<Stroke> strokes;
+            for (std::size_t i = 0; i + 1 < u.size(); i += 2) {
+                strokes.push_back({ d * u[i] + p * s, d * u[i + 1] + p * s });
+            }
+            if (!strokes.empty()) { lines.push_back(std::move(strokes)); }
+        }
+
+        for (std::size_t li = 0; li < lines.size(); li++) {
+            std::vector<Stroke>& strokes = lines[li];
+            if (serpentine && (li % 2 == 1)) {   // hatch: alternate lines end-for-end
+                std::reverse(strokes.begin(), strokes.end());
+                for (Stroke& st : strokes) { std::swap(st.a, st.b); }
+            }
+            for (const Stroke& st : strokes) {
+                Chain c;
+                c.closed = false;
+                c.id = newId();
+                c.edges.push_back(std::make_unique<Segment2>(st.a, st.b));
+                out.push_back(std::move(c));
+            }
+        }
+        return out;
+    }
 
     // =================================================================
     // Parallel -- the seed construction and the inlay (Method/06).
@@ -994,13 +1103,25 @@ export namespace Geo::Frontier {
             weld(fills);
             weld(avoids);
 
+            // Dropped opens are the assembly's failure report: say HOW each one
+            // failed (edge count + closure gap), so a consumer can tell endpoint
+            // slop (gap just past the weld) from garbage sections (huge gaps --
+            // the tell of a tilted or drifted slicing frame).
             auto dropOpen = [&](std::vector<Chain>& v, const char* which) {
-                size_t before = v.size();
-                std::erase_if(v, [](const Chain& c) { return !c.closed; });
-                if (v.size() != before) {
-                    warnings.push_back(std::string("Open ") + which +
-                        " chains were dropped (only closed loops bound regions).");
+                int reported = 0;
+                for (const Chain& c : v) {
+                    if (c.closed || c.edges.empty()) { continue; }
+                    if (reported++ >= 4) { break; }
+                    const float gap = (Kern::eStart(*c.edges.front()) - Kern::eEnd(*c.edges.back())).pythag();
+                    float length = 0.0f;
+                    for (const auto& e : c.edges) { length += Kern::edgeLength(*e); }
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                        "Open %s chain dropped: %zu edge(s), length %.3f, closure gap %.4f",
+                        which, c.edges.size(), length, gap);
+                    warnings.push_back(buf);
                 }
+                std::erase_if(v, [](const Chain& c) { return !c.closed; });
             };
             dropOpen(fills, "fill");
             dropOpen(avoids, "avoid");
@@ -1088,7 +1209,7 @@ export namespace Geo::Frontier {
             while (static_cast<int>(profiles.size()) <= params.maxGenerations) {
                 Profile next = profiles.back().offsetBy(step, params.eps);
                 if (next.empty()) { break; }
-                if (next.signedArea() <= 0.0f) { break; }
+                next.included = next.signedArea() > 0.0f;   // skip downstream, never halt
                 profiles.push_back(std::move(next));
             }
             return true;
