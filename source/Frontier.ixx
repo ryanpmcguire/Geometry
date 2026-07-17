@@ -849,7 +849,7 @@ export namespace Geo::Frontier {
     // retracts and Z are the consumer's grammar, never woven here.
     // =================================================================
     inline std::vector<Chain> raster(const Profile& region, float angleDeg, float spacing,
-                                     bool serpentine) {
+                                     bool serpentine, bool reverse = false) {
 
         std::vector<Chain> out;
 
@@ -906,6 +906,8 @@ export namespace Geo::Frontier {
             if (!strokes.empty()) { lines.push_back(std::move(strokes)); }
         }
 
+        if (reverse) { std::reverse(lines.begin(), lines.end()); }   // scan-advance order
+
         for (std::size_t li = 0; li < lines.size(); li++) {
             std::vector<Stroke>& strokes = lines[li];
             if (serpentine && (li % 2 == 1)) {   // hatch: alternate lines end-for-end
@@ -954,9 +956,22 @@ export namespace Geo::Frontier {
             float toolRadius = 1.0f;
             float stepover = 1.0f;        // generation advance as a FRACTION of the tool radius
             int   maxGenerations = 64;    // inlay cap
-            float eps = 1e-3f;            // endpoint-coincidence tolerance
+            float eps = 1e-3f;            // KERNEL tolerance: crossings, stitching, fragment
+                                          // coincidence -- pure geometry math, never input slop
             float weldEps = 1e-2f;        // almost-closed loops within this gap are welded shut
                                           // (BRep-section endpoints carry approximation slop)
+
+            // ASSEMBLY tolerances, PER SYSTEM, derived from each sectioned solid's
+            // own tolerance (max vertex tolerance; a spec solid ~1e-7, a healed /
+            // measured solid ~1e-2). Two endpoints within a solid's own tolerance
+            // are the SAME point per its model, so assembling there closes
+            // measured-fragmented loops without ever fusing features the solid
+            // keeps genuinely apart. The cut and the avoid are DIFFERENT solids
+            // (a spec delta against a measured part is routine), so each system
+            // assembles at its own figure. 0 = fall back to eps. Assembly
+            // tolerance is input conditioning; the kernel eps above never widens.
+            float fillEps = 0.0f;
+            float avoidEps = 0.0f;
 
             // The extended (lead) region's two expansions, as FRACTIONS of the
             // tool radius. The survey of the open air lead motion may actually
@@ -1082,26 +1097,29 @@ export namespace Geo::Frontier {
             // 1. Assemble. Closed chains only past this door: offsetting is a
             // statement about bounded regions (welding almost-closed input is
             // the caller's conditioning job).
-            std::vector<Chain> fills  = Chain::assemble(fill, params.eps);
-            std::vector<Chain> avoids = Chain::assemble(avoid, params.eps);
+            const float fEps = std::max(params.eps, params.fillEps);
+            const float aEps = std::max(params.eps, params.avoidEps);
+            std::vector<Chain> fills  = Chain::assemble(fill, fEps);
+            std::vector<Chain> avoids = Chain::assemble(avoid, aEps);
 
             // Weld almost-closed loops shut: section endpoints carry slop past
             // the assembly eps, and a loop that is closed in fact but open by a
             // hair must not be dropped at the door. The gap is bridged with a
             // real segment (a marked-closed loop with a geometric hole would
             // break the crossing walk's coincidence matching downstream).
-            auto weld = [&](std::vector<Chain>& v) {
-                for (Chain& c : v) {
+            auto weld = [&](std::vector<Chain>& v, float sysEps) {
+                const float gapEps = std::max(params.weldEps, sysEps);   // a loop's own residual
+                for (Chain& c : v) {                                     // gap scales with its solid
                     if (c.closed || c.edges.empty()) { continue; }
                     Pos a = Kern::eEnd(*c.edges.back());
                     Pos b = Kern::eStart(*c.edges.front());
-                    if ((b - a).pythag() > params.weldEps) { continue; }
+                    if ((b - a).pythag() > gapEps) { continue; }
                     if ((b - a).pythag() > 1e-6f) { c.edges.push_back(std::make_unique<Segment2>(a, b)); }
                     c.closed = true;
                 }
             };
-            weld(fills);
-            weld(avoids);
+            weld(fills, fEps);
+            weld(avoids, aEps);
 
             // Dropped opens are the assembly's failure report: say HOW each one
             // failed (edge count + closure gap), so a consumer can tell endpoint
