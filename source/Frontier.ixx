@@ -331,6 +331,16 @@ export namespace Geo::Frontier {
                 Pos startB = Kern::eStart(*off[(k + 1) % n]);
                 if ((endA - startB).pythag() < 1e-4f) { continue; }   // tangent-continuous: already joined
 
+                // A hole in the source (an edge pruned or radius-culled between
+                // these two) voids the corner-arc construction -- it presumes true
+                // adjacency, and across a hole the arc's far end misses startB by
+                // up to the culled radius, shredding the chain at kernel eps.
+                // Bridge the hole EXACTLY: a straight segment, endpoints verbatim.
+                if (((src[k] + 1) % edges.size()) != src[(k + 1) % n]) {
+                    joinArc[k] = std::make_unique<Segment2>(endA, startB);
+                    continue;
+                }
+
                 if (Kern::fuseCloseTangencies) {
                     Pos ta = Kern::eEndDir(*off[k]);
                     Pos tb = Kern::eStartDir(*off[(k + 1) % n]);
@@ -983,6 +993,13 @@ export namespace Geo::Frontier {
             float leadReach = 2.0f;   // extended fill expansion
             float leadClear = 1.5f;   // extended avoid expansion (never below 1.0)
 
+            // The TRUE-open-air survey's expansions (fractions of R): fill by one
+            // full tool diameter, avoid by two thirds of one. An independent,
+            // parallel construction (nothing in the seed/inlay pipeline reads it);
+            // its product is the openAir member. 0 disables.
+            float airReach = 2.0f;
+            float airClear = 4.0f / 3.0f;
+
             // Generic-position symmetry breaker. The fill is grown by R + fillBias
             // while the avoid is grown by EXACTLY R -- so grown boundaries that
             // would otherwise lie coincident for long stretches (a feature wall a
@@ -1037,6 +1054,17 @@ export namespace Geo::Frontier {
         // half radius off every kept wall (rings graze avoid + R; leads don't).
         Profile extended;
 
+        // TRUE OPEN AIR -- the entry planner's menu of certified sites. The seed
+        // treatment run once more at (fill (+) airReach*R) \ (avoid (+) airClear*R),
+        // and the resulting boundary CLASSIFIED against the original sections:
+        // pieces lying outside BOTH regions are kept, as OPEN chains (segments of
+        // the air ring). On such a segment the whole tool disk hangs a full radius
+        // clear of the cut material and a third of a diameter off every kept wall
+        // -- a plunge there touches nothing. (The extended region cannot certify
+        // this: fill (+) 2R CONTAINS the fill, so membership there proves reach
+        // and wall safety, never disk clearance.)
+        std::vector<Chain> openAir;
+
         void ingest(std::vector<std::unique_ptr<Stoicheion>> fillSet,
                     std::vector<std::unique_ptr<Stoicheion>> avoidSet) {
             fill = std::move(fillSet);
@@ -1090,6 +1118,7 @@ export namespace Geo::Frontier {
             grownFill.clear();
             grownAvoid.clear();
             extended = Profile();
+            openAir.clear();
 
             const float R = params.toolRadius;
             if (R <= 1e-6f) { warnings.push_back("Tool radius is zero: nothing to construct."); return false; }
@@ -1213,6 +1242,60 @@ export namespace Geo::Frontier {
                 }
                 extended.chains = Chain::merge(std::move(g2), params.eps);
                 for (Chain& c : extended.chains) { c.role = Role::Minuend; }
+            }
+
+            // The true-open-air survey: the identical construction once more, at
+            // the air expansions, from the same preserved originals. The merged
+            // ring is part over the cut region (its avoid-derived stretches can
+            // run inside the fill) and part in genuine air; each edge is split at
+            // its crossings with the ORIGINAL section boundaries and the pieces
+            // classified by winding -- outside the fill region (w < 1, CCW base)
+            // AND outside the avoid region (w > -1, CW base) is true air. The
+            // survivors stitch into open segments, oriented, never reversed.
+            if (params.airReach > 1e-4f) {
+
+                const float airF = params.airReach * R + params.fillBias;
+                const float airA = params.airClear * R;
+                std::vector<Chain> g3;
+                for (const Chain& c : fillBoundary) {
+                    for (Chain& m : c.offsetValid(-airF, params.eps)) { g3.push_back(std::move(m)); }
+                }
+                for (const Chain& c : avoidBoundary) {
+                    for (Chain& m : c.offsetValid(+airA, params.eps)) { g3.push_back(std::move(m)); }
+                }
+                std::vector<Chain> ring = Chain::merge(std::move(g3), params.eps);
+
+                std::vector<std::unique_ptr<Stoicheion>> kept;
+                for (Chain& rc : ring) {
+                    for (auto& e : rc.edges) {
+
+                        std::vector<Pos> cuts;
+                        for (const Chain& c : fillBoundary) {
+                            for (const auto& oe : c.edges) { Kern::edgeCross(*e, *oe, cuts); }
+                        }
+                        for (const Chain& c : avoidBoundary) {
+                            for (const auto& oe : c.edges) { Kern::edgeCross(*e, *oe, cuts); }
+                        }
+
+                        std::vector<std::unique_ptr<Stoicheion>> pieces;
+                        Kern::splitEdgeAtPoints(*e, cuts, pieces);
+
+                        for (auto& piece : pieces) {
+                            const Pos mid = Kern::edgeMidpoint(*piece);
+                            int wF = 0, wA = 0;
+                            for (const Chain& c : fillBoundary)  { wF += c.windingAround(mid); }
+                            for (const Chain& c : avoidBoundary) { wA += c.windingAround(mid); }
+                            if (wF < 1 && wA > -1) { kept.push_back(std::move(piece)); }
+                        }
+                    }
+                }
+
+                while (!kept.empty()) {
+                    Chain seg = Chain::buildOne(kept, params.eps, /*allowReverse=*/false);
+                    if (seg.edges.empty()) { break; }
+                    seg.id = newId();
+                    openAir.push_back(std::move(seg));
+                }
             }
 
             profiles.push_back(std::move(seed));
