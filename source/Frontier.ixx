@@ -1014,6 +1014,43 @@ export namespace Geo::Frontier {
             // the extra overrun hangs in open air. Greed on the minuend is free;
             // the subtrahend must stay exact.
             float fillBias = 0.05f;       // model units (absolute: kernel tolerances are absolute)
+
+            // Seed reach knob, as a MULTIPLE of the tool radius. The base fill
+            // grow is seedOffset*R + fillBias (default 1 = exactly R + fillBias,
+            // the plain tool-radius dilation). Larger claims more reach -- the
+            // tool-centre region extends further past the true material, buying
+            // open-air room. Reach only: the grow is still clipped by the exact
+            // avoid term in the merge (avoid stays +R, the hard keep-out), so
+            // over-claiming here only hangs extra centres in air, never drives
+            // the tool into kept material. Only the BASE fill reads it; the
+            // lead/air reach variants keep their own factors.
+            float seedOffset = 1.0f;
+
+            // Clip-seed reach, a MULTIPLE of R (a hair over 1). When seedOffset
+            // runs FAT (corner relief / early exit into free-edge air), the rings
+            // are GENERATED from the fat seed but must ultimately OBEY the true
+            // tool-centre region -- this clip seed, (fill (+) clipSeedOffset*R) \
+            // (avoid (+) R). The strategy clips each fat ring to it, dropping the
+            // far-air arclength. The 0.1R over 1R displaces the clip boundary past
+            // kernel eps from any fat-seed-generated edge (generic position, same
+            // rationale as fillBias). Only built when the fat seed is meaningfully
+            // larger (seedOffset > clipSeedOffset + eps); otherwise the two regions
+            // coincide and the clip is a no-op -- clipSeed stays empty.
+            float clipSeedOffset = 1.1f;
+
+            // Clip-seed AVOID grow, a MULTIPLE of R (a hair UNDER 1). The FAT
+            // seed grows avoid by exactly +R (the real hard keep-out), so a fat
+            // ring's legitimate wall-finish stretch (tool tangent to the wall)
+            // lies exactly on avoid (+) R. If the clip seed also grew avoid by
+            // +R, that stretch would sit ON the clip's avoid boundary, where
+            // winding classification is ill-defined -- the wall pass could be
+            // dropped and the wall left uncut. Growing the clip's avoid a hair
+            // LESS (0.9R) pushes its boundary 0.1R inside the fat wall stretch,
+            // so that stretch is UNAMBIGUOUSLY kept (generic position, mirroring
+            // the fill side's displacement). Safe: the fat seed already enforced
+            // the true +R limit, so a looser clip avoid can only KEEP already-
+            // legal wall pieces, never admit a path into avoid (+) R.
+            float clipAvoidOffset = 0.9f;
         };
 
         Params params;
@@ -1053,6 +1090,18 @@ export namespace Geo::Frontier {
         // inside it stays within feasible reach of the cut and keeps an extra
         // half radius off every kept wall (rings graze avoid + R; leads don't).
         Profile extended;
+
+        // The CLIP seed: the true tool-centre region -- (fill (+) clipSeedOffset*R)
+        // \ (avoid (+) clipAvoidOffset*R) -- that a FAT-seed run must obey. Rings
+        // are generated from the reach-inflated seed (corner relief, early free-
+        // edge exit) then clipped back to this region so the far-air arclength is
+        // dropped. The avoid term is a hair UNDER +R (clipAvoidOffset < 1) so a
+        // fat wall-hugging stretch (at the fat seed's real +R limit) falls inside
+        // this clip and is kept, not dropped on an ill-defined boundary. The true
+        // +R keep-out is still enforced by the FAT seed, so the looser clip avoid
+        // only KEEPS legal travel, never licenses the tool past a wall. Empty unless
+        // the fat seed is meaningfully larger than the clip (see clipSeedOffset).
+        Profile clipSeed;
 
         // TRUE OPEN AIR -- the entry planner's menu of certified sites. The seed
         // treatment run once more at (fill (+) airReach*R) \ (avoid (+) airClear*R),
@@ -1118,6 +1167,7 @@ export namespace Geo::Frontier {
             grownFill.clear();
             grownAvoid.clear();
             extended = Profile();
+            clipSeed = Profile();
             openAir.clear();
 
             const float R = params.toolRadius;
@@ -1191,7 +1241,7 @@ export namespace Geo::Frontier {
             // exact, and grown boundaries never sit coincident.
             std::vector<Chain> grown;
             for (Chain& c : fills) {
-                for (Chain& m : c.offsetValid(-(R + params.fillBias), params.eps)) {
+                for (Chain& m : c.offsetValid(-(params.seedOffset * R + params.fillBias), params.eps)) {
                     grownFill.push_back(m.clone());     // preserved: the merge consumes its input
                     grown.push_back(std::move(m));
                 }
@@ -1242,6 +1292,33 @@ export namespace Geo::Frontier {
                 }
                 extended.chains = Chain::merge(std::move(g2), params.eps);
                 for (Chain& c : extended.chains) { c.role = Role::Minuend; }
+            }
+
+            // The clip seed: the seed's OWN construction once more, at the true
+            // tool radius (clipSeedOffset, a hair over 1R) rather than the fat
+            // seedOffset. The fill side carries the same fillBias (generic
+            // position); the avoid side grows by clipAvoidOffset*R -- a hair
+            // UNDER +R, so the fat seed's wall-hugging stretches (at avoid (+) R,
+            // the real limit the fat seed enforced) sit unambiguously INSIDE
+            // this clip region and are kept, instead of coincident with its
+            // boundary (where winding is ill-defined). The true +R keep-out is
+            // still enforced by the FAT seed; this looser clip avoid can only
+            // keep already-legal wall pieces, never admit avoid (+) R. Built
+            // only when the fat seed is meaningfully larger; when they coincide
+            // the clip would be a no-op, so it is skipped and clipSeed left empty.
+            if (params.clipSeedOffset > 1e-4f
+                && params.seedOffset > params.clipSeedOffset + 0.05f) {
+                const float clipF = params.clipSeedOffset * R + params.fillBias;
+                const float clipA = params.clipAvoidOffset * R;
+                std::vector<Chain> gC;
+                for (const Chain& c : fillBoundary) {
+                    for (Chain& m : c.offsetValid(-clipF, params.eps)) { gC.push_back(std::move(m)); }
+                }
+                for (const Chain& c : avoidBoundary) {
+                    for (Chain& m : c.offsetValid(+clipA, params.eps)) { gC.push_back(std::move(m)); }
+                }
+                clipSeed.chains = Chain::merge(std::move(gC), params.eps);
+                for (Chain& c : clipSeed.chains) { c.role = Role::Minuend; }
             }
 
             // The true-open-air survey: the identical construction once more, at
