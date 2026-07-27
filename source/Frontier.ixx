@@ -1114,10 +1114,25 @@ export namespace Geo::Frontier {
         // and wall safety, never disk clearance.)
         std::vector<Chain> openAir;
 
+        // Pre-oriented avoid path: when the caller has already assembled and
+        // oriented the keep-out as closed loops, feed them whole and SKIP the
+        // engine's assemble/weld/dropOpen/orientByParity for the avoid side.
+        std::vector<Chain> avoidLoops;
+        bool avoidPreOriented = false;
+
         void ingest(std::vector<std::unique_ptr<Stoicheion>> fillSet,
                     std::vector<std::unique_ptr<Stoicheion>> avoidSet) {
             fill = std::move(fillSet);
             avoid = std::move(avoidSet);
+        }
+
+        // Opt-in: supply the avoid as pre-oriented CLOSED loops. INVARIANT --
+        // every loop MUST be closed with role == Role::Subtrahend; the weld /
+        // dropOpen safety net and the joint orientByParity are all skipped for
+        // these, so an open or wrong-role loop is not corrected here.
+        void ingestAvoidLoops(std::vector<Chain> loops) {
+            avoidLoops = std::move(loops);
+            avoidPreOriented = true;
         }
 
         // Orient a system by nesting parity: depth = how many OTHER loops of
@@ -1169,6 +1184,9 @@ export namespace Geo::Frontier {
             extended = Profile();
             clipSeed = Profile();
             openAir.clear();
+            // NB: do NOT clear avoidPreOriented/avoidLoops here -- ingestAvoidLoops
+            // runs before run(). They are consumed (moved-from) below; a fresh
+            // Parallel per level means no stale carry-over.
 
             const float R = params.toolRadius;
             if (R <= 1e-6f) { warnings.push_back("Tool radius is zero: nothing to construct."); return false; }
@@ -1179,7 +1197,8 @@ export namespace Geo::Frontier {
             const float fEps = std::max(params.eps, params.fillEps);
             const float aEps = std::max(params.eps, params.avoidEps);
             std::vector<Chain> fills  = Chain::assemble(fill, fEps);
-            std::vector<Chain> avoids = Chain::assemble(avoid, aEps);
+            std::vector<Chain> avoids = avoidPreOriented ? std::move(avoidLoops)
+                                                         : Chain::assemble(avoid, aEps);
 
             // Weld almost-closed loops shut: section endpoints carry slop past
             // the assembly eps, and a loop that is closed in fact but open by a
@@ -1198,7 +1217,7 @@ export namespace Geo::Frontier {
                 }
             };
             weld(fills, fEps);
-            weld(avoids, aEps);
+            if (!avoidPreOriented) { weld(avoids, aEps); }   // pre-oriented loops are already closed
 
             // Dropped opens are the assembly's failure report: say HOW each one
             // failed (edge count + closure gap), so a consumer can tell endpoint
@@ -1221,7 +1240,7 @@ export namespace Geo::Frontier {
                 std::erase_if(v, [](const Chain& c) { return !c.closed; });
             };
             dropOpen(fills, "fill");
-            dropOpen(avoids, "avoid");
+            if (!avoidPreOriented) { dropOpen(avoids, "avoid"); }   // pre-oriented loops guaranteed closed
 
             if (fills.empty()) {
                 warnings.push_back("No closed fill boundary: nothing to cut.");
@@ -1230,7 +1249,9 @@ export namespace Geo::Frontier {
 
             // 2. Orient: one nesting tree, opposite bases (Method/05, 06).
             orientByParity(fills,  +1, Role::Minuend);      // fill: outers CCW, islands CW
-            orientByParity(avoids, -1, Role::Subtrahend);   // avoid: outers CW, islands CCW
+            // avoid: pre-oriented loops keep the caller's own-parity handedness;
+            // re-deriving JOINT parity here would flip deep nested walls (gouge).
+            if (!avoidPreOriented) { orientByParity(avoids, -1, Role::Subtrahend); }   // avoid: outers CW, islands CCW
 
             // 3. Grow BOTH by one tool radius. Fill by -R (left of CCW travel
             // is the interior, so -R expands); avoid by +R (left of CW travel
