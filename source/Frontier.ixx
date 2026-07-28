@@ -1026,14 +1026,21 @@ export namespace Geo::Frontier {
             // lead/air reach variants keep their own factors.
             float seedOffset = 1.0f;
 
-            // Clip-seed reach, a MULTIPLE of R (a hair over 1). When seedOffset
-            // runs FAT (corner relief / early exit into free-edge air), the rings
-            // are GENERATED from the fat seed but must ultimately OBEY the true
-            // tool-centre region -- this clip seed, (fill (+) clipSeedOffset*R) \
-            // (avoid (+) R). The strategy clips each fat ring to it, dropping the
-            // far-air arclength. The 0.1R over 1R displaces the clip boundary past
-            // kernel eps from any fat-seed-generated edge (generic position, same
-            // rationale as fillBias). Only built when the fat seed is meaningfully
+            // Clip-seed FILL reach, a MULTIPLE of R (a hair over 1). This is a
+            // generic-position PROXY of the true tool-centre wall -- exact-boundary
+            // clipping (fill (+) exactly R) is numerically fragile (Weiler-Atherton
+            // on coincident edges), so the clip region is displaced a hair OUTWARD
+            // (0.1R) from the true wall. When seedOffset runs FAT (corner relief /
+            // early exit into free-edge air), the cascade rings are GENERATED from
+            // the fat seed but must OBEY this proxy of the true tool-centre region --
+            // (fill (+) clipSeedOffset*R) \ (avoid (+) clipAvoidOffset*R). The
+            // strategy clips each fat CASCADE ring to it, dropping the far-air
+            // arclength. This proxy is the FINISH clip target; the strategy insets it
+            // by wallStock to form the ROUGH clip target (the inset-seed proxy). The
+            // 0.1R over 1R displaces the clip boundary past kernel eps from any
+            // fat-seed-generated edge (generic position, same rationale as fillBias).
+            // wallStock is NEVER on this seed -- it re-enters only on the ROUGH clip
+            // proxy, strategy-side. Only built when the fat seed is meaningfully
             // larger (seedOffset > clipSeedOffset + eps); otherwise the two regions
             // coincide and the clip is a no-op -- clipSeed stays empty.
             float clipSeedOffset = 1.1f;
@@ -1051,6 +1058,17 @@ export namespace Geo::Frontier {
             // the true +R limit, so a looser clip avoid can only KEEP already-
             // legal wall pieces, never admit a path into avoid (+) R.
             float clipAvoidOffset = 0.9f;
+
+            // DEPRECATED / UNUSED by the engine. Wall stock is NOT a seed term:
+            // wallStock is a BINARY FINAL-EMISSION choice made STRATEGY-side. The
+            // engine builds two seed regions -- the (fat) offset seed (profiles[0],
+            // the free-form cascade origin) and the TRUE seed (trueSeed, the real
+            // tool-centre wall at cut R / avoid R) -- and exposes trueSeed so the
+            // strategy emits its outermost ring as either the true seed (finish) or
+            // the true seed inset by the wall skin (rough). No cascade geometry ever
+            // carries the skin. Retained only so existing initializers compile; the
+            // engine seed no longer reads it.
+            float wallStock = 0.0f;
         };
 
         Params params;
@@ -1102,6 +1120,17 @@ export namespace Geo::Frontier {
         // only KEEPS legal travel, never licenses the tool past a wall. Empty unless
         // the fat seed is meaningfully larger than the clip (see clipSeedOffset).
         Profile clipSeed;
+
+        // The TRUE seed: the real tool-centre wall region -- (fill (+) R) \
+        // (avoid (+) R), i.e. seedOffset = 1 and NO wall stock. Built ALWAYS
+        // (ungated), by the SAME seed machinery as profiles[0] but at the true
+        // radius, from the same preserved originals. This is the AUTHORITATIVE
+        // dimensional wall: the strategy emits it (finish) or its uniform inset
+        // by the wall skin (rough) as the single outermost ring, and bounds link
+        // containment against it. profiles[0] (the possibly-fat offset seed) stays
+        // the free-form cascade origin; when seedOffset == 1 the two coincide, so
+        // the strategy drops profiles[0] and emits trueSeed once (no duplicate).
+        Profile trueSeed;
 
         // TRUE OPEN AIR -- the entry planner's menu of certified sites. The seed
         // treatment run once more at (fill (+) airReach*R) \ (avoid (+) airClear*R),
@@ -1340,6 +1369,28 @@ export namespace Geo::Frontier {
                 }
                 clipSeed.chains = Chain::merge(std::move(gC), params.eps);
                 for (Chain& c : clipSeed.chains) { c.role = Role::Minuend; }
+            }
+
+            // The TRUE seed: the seed's OWN construction once more, at the true
+            // tool radius (seedOffset = 1) and NO wall stock -- (fill (+) R) \
+            // (avoid (+) R). Built UNCONDITIONALLY (not gated on a fat seed): it
+            // is the authoritative dimensional wall the strategy emits as its
+            // outermost ring (finish = this; rough = this inset by the wall skin)
+            // and bounds link containment against. The fill side keeps the same
+            // fillBias for generic position; the avoid side is a clean +R (the
+            // real hard keep-out). Distinct from clipSeed, whose avoid is a hair
+            // UNDER +R for winding-safe clipping -- this is the exact wall.
+            {
+                const float trueF = R + params.fillBias;
+                std::vector<Chain> gT;
+                for (const Chain& c : fillBoundary) {
+                    for (Chain& m : c.offsetValid(-trueF, params.eps)) { gT.push_back(std::move(m)); }
+                }
+                for (const Chain& c : avoidBoundary) {
+                    for (Chain& m : c.offsetValid(+R, params.eps)) { gT.push_back(std::move(m)); }
+                }
+                trueSeed.chains = Chain::merge(std::move(gT), params.eps);
+                for (Chain& c : trueSeed.chains) { c.role = Role::Minuend; }
             }
 
             // The true-open-air survey: the identical construction once more, at
