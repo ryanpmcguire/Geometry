@@ -7,6 +7,7 @@ module;
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 
 export module Geo.Frontier;
 
@@ -1084,6 +1085,8 @@ export namespace Geo::Frontier {
         // deeper. Warnings are plain-language deviations, empty on a clean run.
         std::vector<Profile> profiles;
         std::vector<std::string> warnings;
+        double timingPreparationMs = 0.0;
+        double timingInlayMs = 0.0;
 
         // The oriented, welded FILL section (material boundary at this slice),
         // kept after run() for consumers: winding >= 1 against these chains is
@@ -1203,6 +1206,14 @@ export namespace Geo::Frontier {
         // warning) when no seed exists -- the avoid swallows the fill, or
         // the fill never assembled into a closed region.
         bool run() {
+
+            using Clock = std::chrono::steady_clock;
+            const auto runStarted = Clock::now();
+            auto elapsedMs = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            timingPreparationMs = 0.0;
+            timingInlayMs = 0.0;
 
             profiles.clear();
             warnings.clear();
@@ -1380,7 +1391,13 @@ export namespace Geo::Frontier {
             // fillBias for generic position; the avoid side is a clean +R (the
             // real hard keep-out). Distinct from clipSeed, whose avoid is a hair
             // UNDER +R for winding-safe clipping -- this is the exact wall.
-            {
+            if (std::fabs(params.seedOffset - 1.0f) <= 1e-6f) {
+                // The default seed construction is already exactly
+                // (fill +(R+bias)) \ (avoid +R). Reuse that result instead of
+                // performing the same offsets and winding merge a second time.
+                for (const Chain& c : seed.chains) { trueSeed.chains.push_back(c.clone()); }
+            }
+            else {
                 const float trueF = R + params.fillBias;
                 std::vector<Chain> gT;
                 for (const Chain& c : fillBoundary) {
@@ -1449,6 +1466,9 @@ export namespace Geo::Frontier {
 
             profiles.push_back(std::move(seed));
 
+            timingPreparationMs = elapsedMs(runStarted, Clock::now());
+            const auto inlayStarted = Clock::now();
+
             // 5. The inlay: recursively inset until extinction or the cap.
             // profiles[0] is already the outermost CUTTABLE ring -- the seed
             // stands one radius off every wall by construction -- so every
@@ -1462,6 +1482,7 @@ export namespace Geo::Frontier {
                 next.included = next.signedArea() > 0.0f;   // skip downstream, never halt
                 profiles.push_back(std::move(next));
             }
+            timingInlayMs = elapsedMs(inlayStarted, Clock::now());
             return true;
         }
     };
