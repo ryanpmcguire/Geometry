@@ -604,7 +604,14 @@ export namespace Geo {
             double td = (P - A).dot(D) / l2;
             t = static_cast<float>(td);
             if (td < 0.0 || td > 1.0) { return false; }
-            return (P - A).len() > 1e-3 && (P - dPos(b)).len() > 1e-3;
+            // The endpoint exclusion exists to ignore deliberate vertex
+            // junctions -- so it must stay SMALL RELATIVE TO THE EDGE. A flat
+            // 1e-3 made every edge shorter than 2e-3 crossing-INVISIBLE at any
+            // angle -- and offset join arcs at ring corners are exactly that
+            // short, exactly where annulus collisions land (two whole rings
+            // sailing through each other, uncut).
+            const double margin = std::min(1e-3, 0.25 * std::sqrt(l2));
+            return (P - A).len() > margin && (P - dPos(b)).len() > margin;
         }
         // True when a point on a circular edge's circle lies strictly inside its
         // swept range. A full circle (sweep == TAU) contains its whole circumference
@@ -617,7 +624,10 @@ export namespace Geo {
             double rel = dWrap(d.angle() - static_cast<double>(a0));
             if (rel > static_cast<double>(sweep)) { return false; }
             double r = d.len();
-            return rel * r > 1e-3 && (static_cast<double>(sweep) - rel) * r > 1e-3;
+            // endpoint exclusion proportional to the ARC, never larger (see
+            // onSeg): a short join arc must stay crossable
+            const double margin = std::min(1e-3, 0.25 * static_cast<double>(sweep) * r);
+            return rel * r > margin && (static_cast<double>(sweep) - rel) * r > margin;
         }
 
         // A uniform travel sampler for a parametric edge (offset ellipse or spline):

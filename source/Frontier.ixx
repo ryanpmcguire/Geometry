@@ -82,6 +82,13 @@ export namespace Geo::Frontier {
         // fillet at the offset distance, within numerical slop): culled outright
         static constexpr float RadiusCull = 1e-2f;
 
+        // Below this signed area (mm^2) a closed loop bounds no cuttable region:
+        // it is stitching noise (cusp slivers off a merged lobe). Judged nowhere
+        // NEAR real geometry (smallest legitimate frontier pockets are step^2
+        // scale, ~1 mm^2) and vital everywhere: an un-culled zero-area CW sliver
+        // offset-DILATES into an immortal spurious ring (see offsetValid).
+        static constexpr float SignificanceAreaFloor = 0.05f;
+
         Chain() = default;
         Chain(Chain&&) = default;
         Chain& operator=(Chain&&) = default;
@@ -252,13 +259,172 @@ export namespace Geo::Frontier {
             return best;
         }
 
+        // A point strictly INSIDE the loop, never on it: nudge inward (-x) of the
+        // max-x point, verified against the loop's own winding. A boundary point's
+        // winding against a touching sibling is a coin flip; an interior point is
+        // unambiguous under tangency.
+        static Pos interiorPoint(const Chain& L) {
+            const Pos mx = maxXPoint(L);
+            for (float nudge : { 1e-3f, 1e-2f, 1e-1f }) {
+                const Pos q(mx.x - nudge, mx.y);
+                if (L.windingAround(q) != 0) { return q; }
+            }
+            return mx;   // degenerate sliver: the boundary point is all there is
+        }
+
+        // Hard-weld: enforce EXACT junction coincidence by snapping both
+        // neighbours to their mean -- never a micro bridge segment (a sub-eps
+        // edge is invisible to crossing detection and poison to the walk, and a
+        // marked-closed loop with a real gap breaks coincidence matching).
+        // assemble() connects within eps, so every interior joint carries
+        // up-to-eps slop until this runs. An edge that cannot absorb the snap
+        // (degenerate under mutation) falls back to one exact bridge.
+        static void hardWeld(Chain& c, float eps) {
+            const size_t n = c.edges.size();
+            if (n == 0) { return; }
+            const size_t joints = c.closed ? n : (n - 1);
+            std::vector<size_t> bridgeAfter;
+            for (size_t k = 0; k < joints; k++) {
+                Stoicheion& A = *c.edges[k];
+                Stoicheion& B = *c.edges[(k + 1) % n];
+                const Pos a = Kern::eEnd(A);
+                const Pos b = Kern::eStart(B);
+                const float gap = (b - a).pythag();
+                if (gap <= 1e-9f) { continue; }      // already exact
+                if (gap > eps)    { continue; }      // a real gap: not ours to hide
+                const Pos mid = (a + b) * 0.5f;
+                const bool aOk = Kern::setEdgeEnd(A, mid);
+                const bool bOk = Kern::setEdgeStart(B, mid);
+                if (!aOk || !bOk) { bridgeAfter.push_back(k); }
+            }
+            for (size_t bi = bridgeAfter.size(); bi > 0; bi--) {
+                const size_t k = bridgeAfter[bi - 1];
+                const Pos a = Kern::eEnd(*c.edges[k]);
+                const Pos b = Kern::eStart(*c.edges[(k + 1) % n]);
+                if ((b - a).pythag() > 1e-9f) {
+                    c.edges.insert(c.edges.begin() + static_cast<std::ptrdiff_t>(k) + 1,
+                                   std::make_unique<Segment2>(a, b));
+                }
+            }
+        }
+
+        // The nesting primitive, by the algebra: loops that INTERSECT are neither
+        // neighbors nor nested (the crossing machinery owns that case); loops
+        // that are crossing-free are nested-or-neighbors, and that is a GLOBAL
+        // fact decidable at ONE sample -- so the effort goes not into many
+        // samples (a vote averages around the problem) but into choosing the
+        // SAFEST one: the point of the inner loop with MAXIMUM clearance from
+        // the outer's curve -- the deepest point of the SDF, where the side
+        // reading cannot be ambiguous.
+        static bool containedIn(const Chain& inner, const Chain& outer) {
+            Pos best{}; float bestD = -1.0f;
+            for (const auto& e : inner.edges) {
+                const Pos m = Kern::edgeMidpoint(*e);
+                float d = 1e30f;
+                for (const auto& o : outer.edges) { d = std::min(d, o->distanceTo(m)); }
+                if (d > bestD) { bestD = d; best = m; }
+            }
+            if (bestD < 0.0f) { return false; }
+            return outer.windingAround(best) != 0;
+        }
+
+        // The parity cull (the nesting rule). Within ONE RESOLVED ring system,
+        // alternation is law: the frontier of { winding >= 1 } can never contain a
+        // ring nested inside a SAME-handed ring -- the inner ring would bound
+        // material on both sides or neither. Any such survivor is a doubled bound
+        // or a fabricated artifact loop (the non-tangent-joint micro loop), and
+        // every downstream winding it touches is corrupted. CULL the inner ring;
+        // never reorient -- flipping fabricates a hole that does not exist.
+        // Orientation is established once at consumption and blindly applied;
+        // this is the enforcement pass, not a repair.
+        static void cullSameHandedNested(std::vector<Chain>& rings) {
+            const size_t n = rings.size();
+            if (n < 2) { return; }
+            std::vector<int>  turn(n, 0);
+            std::vector<Pos>  probe(n);
+            for (size_t i = 0; i < n; i++) {
+                if (!rings[i].closed || rings[i].edges.empty()) { continue; }
+                int h = rings[i].handedness();
+                if (h == 0) { h = rings[i].turningSign(); }   // degenerate area: turning judges
+                turn[i]  = h;
+                probe[i] = interiorPoint(rings[i]);
+            }
+            std::vector<char> cull(n, 0);
+            for (size_t i = 0; i < n; i++) {
+                if (turn[i] == 0) { continue; }
+                for (size_t j = 0; j < n; j++) {
+                    if (j == i || turn[j] != turn[i]) { continue; }
+                    // i strictly inside j, same handedness -> i is the violator
+                    // (containment by vote -- no single-probe coin flips)
+                    if (containedIn(rings[i], rings[j])
+                        && !containedIn(rings[j], rings[i])) {
+                        cull[i] = 1;
+                        break;
+                    }
+                }
+            }
+            size_t w = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (!cull[i]) { rings[w++] = std::move(rings[i]); }
+            }
+            rings.resize(w);
+        }
+
         // Beat one: the blind offset (Method/02)
         //--------------------------------------------------
         // Every edge slides to the LEFT of its own travel by `amount`; every
-        // corner is bridged by the join arc known by construction (centred on
-        // the original corner, radius |amount|). No winding test, no preferred
-        // side -- inset vs outset EMERGES from each chain's own chirality. The
-        // result may self-intersect; those crossings are beat two's input.
+        // corner is bridged by the join known by construction. No winding test,
+        // no preferred side -- inset vs outset EMERGES from each chain's own
+        // chirality. The result may self-intersect; those crossings are beat
+        // two's input.
+
+        // EXPERIMENT SWITCH: true = the legacy always-arc corner joins; false =
+        // arcs only where the push side OPENS A GAP (convex relative to the
+        // offset), straight lines on the overlap side. The overlap-side join is
+        // transient scar tissue the crossing walk excises anyway, and a line
+        // cannot wrap, cannot flip its side, and crosses cleanly exactly where
+        // the arc construction's side pick lives on the epsilon knife edge.
+        static constexpr bool JoinAlwaysArcs = false;
+
+        // The corner bridge between two offset edges. `arcs` selects the mode;
+        // tA/tB are the ORIGINAL edges' tangents at the original vertex (the
+        // convexity judges), offDirA the offset edge's end tangent (the arc's
+        // side pick). Null = tangent-continuous / degenerate: no bridge needed.
+        static std::unique_ptr<Stoicheion> join(bool arcs, Pos corner, Pos endA, Pos startB,
+                                                Pos tA, Pos tB, Pos offDirA, float amount) {
+            if (!arcs) {
+                // Gap opens only when the push side is the OUTSIDE of the turn:
+                // cross(tA, tB) * amount < 0 under the left-push convention.
+                // Overlap-side AND near-tangent (cross ~ 0) corners take the line.
+                if (static_cast<double>(tA.cross(tB)) * static_cast<double>(amount) >= 0.0) {
+                    return std::make_unique<Segment2>(endA, startB);
+                }
+            }
+
+            // All angle math in DOUBLE: a nearly-complete around-the-bend arc
+            // subtracts two nearly-equal angles.
+            dPos C(corner);
+            dPos radial = dPos(endA) - C;
+            double r = radial.len();
+            if (r < 1e-12) { return nullptr; }
+            int s = (dPos(offDirA).dot(radial.perp()) >= 0.0) ? 1 : -1;
+            double angA = radial.angle(), angB = (dPos(startB) - C).angle();
+            double span = (s > 0) ? dWrap(angB - angA) : dWrap(angA - angB);
+            // The side dot above is EPSILON-SCALE at a near-tangent corner: a
+            // coin-flipped side wraps the span to 2pi - true and the bridge
+            // becomes a near-full-circle arc (the opposite-handed mini loop; the
+            // same sign-flip-wraps-full-turn disease as the firmware G2/G3 bug).
+            // A corner's turn can never exceed pi, so span > pi IS the proof the
+            // side flipped: take the complement. Threshold-free, exact.
+            if (span > 3.14159265358979324 + 1e-3) {
+                s = -s;
+                span = 6.28318530717958648 - span;
+            }
+            double midAng = angA + static_cast<double>(s) * span * 0.5;
+            return std::make_unique<Arc2>(corner, endA, startB,
+                                          (C + dPos::fromAngle(midAng) * r).f());
+        }
+
         Chain offsetRaw(float amount) const {
             Chain result;
             if (edges.empty()) { return result; }
@@ -357,18 +523,10 @@ export namespace Geo::Frontier {
                     }
                 }
 
-                // All angle math in DOUBLE: a nearly-complete around-the-bend
-                // arc subtracts two nearly-equal angles.
-                dPos C(corner);
-                dPos radial = dPos(endA) - C;
-                double r = radial.len();
-                if (r < 1e-12) { continue; }
-                int s = (dPos(Kern::eEndDir(*off[k])).dot(radial.perp()) >= 0.0) ? 1 : -1;
-                double angA = radial.angle(), angB = (dPos(startB) - C).angle();
-                double span = (s > 0) ? dWrap(angB - angA) : dWrap(angA - angB);
-                double midAng = angA + static_cast<double>(s) * span * 0.5;
-                joinArc[k] = std::make_unique<Arc2>(corner, endA, startB,
-                                                    (C + dPos::fromAngle(midAng) * r).f());
+                joinArc[k] = join(JoinAlwaysArcs, corner, endA, startB,
+                                  Kern::eEndDir(*edges[src[k]]),
+                                  Kern::eStartDir(*edges[src[(k + 1) % n]]),
+                                  Kern::eEndDir(*off[k]), amount);
             }
 
             for (size_t i = 0; i < n; i++) {
@@ -397,7 +555,7 @@ export namespace Geo::Frontier {
             // 1. every self-crossing, remembering which two edges meet there.
             //    (edgeCross is transversal-only: a tangential kiss is rejected
             //    at detection -- its +-1 would be float noise in the walk.)
-            struct Rec { Pos p; size_t i, j; };
+            struct Rec { Pos p; size_t i, j; bool firedI = false, firedJ = false; };
             std::vector<Rec> recs;
             std::vector<std::vector<Pos>> pts(n);
             for (size_t i = 0; i < n; i++) {
@@ -424,12 +582,22 @@ export namespace Geo::Frontier {
             for (size_t k = 0; k < run.edges.size(); k++) {
                 run.level[k] = count;
                 Pos v = Kern::eEnd(*run.edges[k]);
-                for (const Rec& r : recs) {
+                for (Rec& r : recs) {
                     if ((r.p - v).pythag() >= eps) { continue; }
                     size_t other = (from[k] == r.i) ? r.j
                                  : (from[k] == r.j) ? r.i : static_cast<size_t>(-1);
                     if (other == static_cast<size_t>(-1)) { continue; }
-                    Pos tOur = Kern::eEndDir(*run.edges[k]);
+                    // ONE increment per crossing per strand: two crossings within
+                    // eps of each other put a sub-edge end inside BOTH records'
+                    // capture radius, and double-firing corrupts the level of
+                    // every sub-edge after it (the close-intersection case).
+                    bool& fired = (from[k] == r.i) ? r.firedI : r.firedJ;
+                    if (fired) { continue; }
+                    fired = true;
+                    // Both tangents from the ORIGINAL curves at the true crossing
+                    // point: a sub-edge between two close cuts is micro, and its
+                    // eEndDir is noise -- exactly where the +-1 must not coin-flip.
+                    Pos tOur = Kern::travelDirAt(*edges[from[k]], r.p);
                     Pos tOther = Kern::travelDirAt(*edges[other], r.p);
                     count += (tOur.cross(tOther) > 0.0f) ? 1 : -1;
                 }
@@ -622,6 +790,15 @@ export namespace Geo::Frontier {
         // region's boundary; an open chain bounds nothing.
         if (!closed || edges.empty()) { return out; }
 
+        // Geometric-significance floor. A near-zero-area loop is boundary NOISE
+        // (a cusp sliver shed by a merge), and offsetting one is how noise turns
+        // IMMORTAL: area ~0 defeats handedness, turningSign takes over, and a
+        // CW-turning sliver reads as a growth-side chain -- it DILATES every
+        // generation into a spurious ring that outlives the real geometry and
+        // cascades to the generation cap. Below the floor there is no region to
+        // bound: refuse to offset it at all.
+        if (std::fabs(signedArea()) < SignificanceAreaFloor) { return out; }
+
         int h = handedness();
         if (h == 0) { h = turningSign(); }        // degenerate area: fall back to turning
         if (h == 0) { return out; }               // no orientation at all: nothing to say
@@ -651,13 +828,31 @@ export namespace Geo::Frontier {
             out.push_back(std::move(m));
         }
 
-        // The inversion guard, sigma-gated.
-        if (sigma > 0.0f) {
+        // The inversion guard, UNCONDITIONAL. The method is create-then-cull:
+        // opposite-handed loops are expected intermediates (through-zero
+        // re-emergence, pinched voids, close-crossing level slips) and the cull
+        // is the contract. The old sigma gate guarded only the SHRINKING side --
+        // "growth cannot invert" -- but a GROWING opposite-handed chain (an
+        // annulus seed's hole family grows every generation) ran with the guard
+        // off, and any inverted survivor that reached the kept extreme level
+        // sailed through: the un-culled opposite-handed loop class. At the
+        // extreme level an opposite-handed child is never a legitimate frontier
+        // (legitimate pinched voids live on non-extreme levels by the walk's own
+        // accounting), so the cull needs no gate.
+        {
             const int srcH = h;
             std::erase_if(out, [srcH](const Chain& m) {
                 return m.closed && m.turningSign() == -srcH;
             });
         }
+        (void)sigma;
+
+        // The parity cull: one chain's valid offset children may split into
+        // disjoint siblings, never into same-handed nesting -- a same-handed
+        // child inside another is the non-tangent-joint artifact loop (a level
+        // the crossing walk failed to separate). Culled at birth, before it can
+        // poison a merge or a cascade winding.
+        cullSameHandedNested(out);
         return out;
     }
 
@@ -698,8 +893,9 @@ export namespace Geo::Frontier {
                     if (!x.empty()) { return true; }
                 }
             }
-            if (loops[b].windingAround(maxXPoint(loops[a])) != 0) { return true; }
-            if (loops[a].windingAround(maxXPoint(loops[b])) != 0) { return true; }
+            // containment by VOTE (see containedIn): no single-probe coin flips
+            if (containedIn(loops[a], loops[b])) { return true; }
+            if (containedIn(loops[b], loops[a])) { return true; }
             return false;
         };
         std::vector<int> cluster(n, -1);
@@ -731,46 +927,145 @@ export namespace Geo::Frontier {
             // A lone loop has nothing to overlap: through untouched.
             if (mem.size() == 1) { out.push_back(std::move(loops[mem[0]])); continue; }
 
-            std::vector<std::unique_ptr<Stoicheion>> kept;
-            for (size_t a : mem) {
-                for (const auto& edge : loops[a].edges) {
+            // LEVEL-WALK CLASSIFICATION -- the field algebra, cross-chain.
+            // Side probes classified each piece independently at noise-scale
+            // offsets and could not distinguish, among several same-handed
+            // result chains, the true frontier from non-extremal junk (the
+            // annulus that never merges with its inset ring). Crossing numbers
+            // can: the left-side winding of a piece changes ONLY at crossings,
+            // by a sign read off two exact tangents.
+            //
+            //   1. record every crossing, BOTH strands (transversal + vertex-landing)
+            //   2. split each loop's edges at its crossings, travel order kept
+            //   3. per loop: read the other loops' winding ONCE, at the safest
+            //      piece (max clearance), then ACCUMULATE along the walk
+            //   4. closed-walk invariant: one full lap returns to its starting
+            //      level; violation = a swallowed crossing -> legacy side
+            //      probes for this cluster (fail toward the proven path)
+            //   5. keep pieces whose LEFT level is exactly 1 (material-left)
 
-                    // Cut this edge wherever any other cluster loop crosses it.
-                    std::vector<Pos> cuts;
-                    for (size_t b : mem) {
-                        if (b == a) { continue; }
-                        for (const auto& eb : loops[b].edges) { Kern::edgeCross(*edge, *eb, cuts); }
+            // -- 1. crossing records
+            struct XRec {
+                Pos p; size_t la, lb;
+                const Stoicheion* ea; const Stoicheion* eb;
+                bool usedA = false, usedB = false;
+            };
+            std::vector<XRec> recs;
+            for (size_t ia = 0; ia < mem.size(); ia++) {
+                for (size_t ib = ia + 1; ib < mem.size(); ib++) {
+                    const size_t a = mem[ia], b = mem[ib];
+                    for (const auto& eA : loops[a].edges) {
+                        for (const auto& eB : loops[b].edges) {
+                            std::vector<Pos> x;
+                            Kern::edgeCross(*eA, *eB, x);
+                            for (const Pos& p : x) { recs.push_back({ p, a, b, eA.get(), eB.get() }); }
+                            // vertex-landing: a genuine crossing ON a vertex is
+                            // invisible to edgeCross (strict interiority)
+                            const Pos vB = Kern::eStart(*eB);
+                            if (eA->distanceTo(vB) < 2e-3f) { recs.push_back({ vB, a, b, eA.get(), eB.get() }); }
+                            const Pos vA = Kern::eStart(*eA);
+                            if (eB->distanceTo(vA) < 2e-3f) { recs.push_back({ vA, a, b, eA.get(), eB.get() }); }
+                        }
                     }
-                    std::vector<std::unique_ptr<Stoicheion>> pieces;
-                    Kern::splitEdgeAtPoints(*edge, cuts, pieces);
+                }
+            }
+            // duplicates (an edgeCross hit re-found by the vertex sweep) would
+            // double a transition; genuine distinct crossings sit further apart
+            std::erase_if(recs, [&recs](const XRec& r) {
+                for (const XRec& s : recs) {
+                    if (&s == &r) { return false; }              // keep the first of a pair
+                    if (s.la == r.la && s.lb == r.lb
+                        && (s.p - r.p).pythag() < 5e-4f) { return true; }
+                }
+                return false;
+            });
 
-                    // Frontier test: material on exactly one side. The probe
-                    // reach is ABSOLUTE distance, bounded by real clearance to
-                    // the other loops -- never a parameter tolerance.
-                    for (auto& piece : pieces) {
-                        Pos mid = Kern::edgeMidpoint(*piece);
-                        Pos t = Kern::travelDirAt(*piece, mid);
+            // -- 2. per-loop pieces, travel-ordered
+            struct TaggedPiece { std::unique_ptr<Stoicheion> e; size_t loop; };
+            std::vector<TaggedPiece> pieces;
+            std::vector<std::pair<size_t, size_t>> range(n, { 0, 0 });   // per-loop [first, count)
+            for (size_t a : mem) {
+                const size_t first = pieces.size();
+                for (const auto& edge : loops[a].edges) {
+                    std::vector<Pos> cuts;
+                    for (const XRec& r : recs) {
+                        if (r.la == a && r.ea == edge.get()) { cuts.push_back(r.p); }
+                        if (r.lb == a && r.eb == edge.get()) { cuts.push_back(r.p); }
+                    }
+                    std::vector<std::unique_ptr<Stoicheion>> sub;
+                    Kern::splitEdgeAtPoints(*edge, cuts, sub);
+                    for (auto& s : sub) { pieces.push_back({ std::move(s), a }); }
+                }
+                range[a] = { first, pieces.size() - first };
+            }
 
-                        float clearance = 1e30f;
-                        for (size_t b : mem) {
-                            for (const auto& le : loops[b].edges) {
-                                if (le.get() == edge.get()) { continue; }
-                                clearance = std::min(clearance, le->distanceTo(mid));
-                            }
+            // -- 3+4. per-piece side classification. Crossing, winding, turning
+            //    and intersection are DIFFERENT things, and only crossing --
+            //    which side of each other loop this span lies on -- decides the
+            //    frontier. The cluster loops are simple (post-orient,
+            //    post-cull), so "which side of B" is well-defined everywhere
+            //    off B's boundary, and a piece lies strictly BETWEEN crossings:
+            //    its B-side is CONSTANT over its span and readable directly at
+            //    its own interior points. No tangent signs, no accumulation
+            //    state -- the crossings' only job was the cuts that bound the
+            //    pieces. Three samples must agree; disagreement = a crossing
+            //    was missed inside this piece (a straddler) -> fall back.
+            std::vector<int> level(pieces.size(), 0);
+            bool levelOk = true;
+            for (size_t a : mem) {
+                const auto [first, count] = range[a];
+                if (count == 0) { continue; }
+
+                int h = loops[a].handedness();
+                if (h == 0) { h = loops[a].turningSign(); }
+                if (h == 0) { levelOk = false; break; }
+                const int ownLeft = (h > 0) ? 1 : 0;   // own contribution left of travel
+
+                for (size_t k = first; k < first + count && levelOk; k++) {
+                    int w[3]; std::size_t wi = 0;
+                    for (float t : { 0.25f, 0.5f, 0.75f }) {
+                        const Pos q = Kern::edgePointAt(*pieces[k].e, t);
+                        int sum = 0;
+                        for (size_t b : mem) { if (b != a) { sum += loops[b].windingAround(q); } }
+                        w[wi++] = sum;
+                    }
+                    if (w[0] != w[1] || w[1] != w[2]) { levelOk = false; break; }   // straddler: missed cut
+                    level[k] = ownLeft + w[1];
+                }
+                if (!levelOk) { break; }
+            }
+
+            // -- 5. keep the frontier; on a parity violation fall back to the
+            //       proven side-probe classification for this cluster
+            std::vector<std::unique_ptr<Stoicheion>> kept;
+            if (levelOk) {
+                for (auto& tp : pieces) {
+                    if (level[&tp - pieces.data()] == 1) {
+                        tp.e->id = loops[tp.loop].id;   // provenance
+                        kept.push_back(std::move(tp.e));
+                    }
+                }
+            }
+            else {
+                for (auto& tp : pieces) {
+                    const Pos mid = Kern::edgeMidpoint(*tp.e);
+                    const Pos t = Kern::travelDirAt(*tp.e, mid);
+                    float clearance = 1e30f;
+                    for (size_t b : mem) {
+                        for (const auto& le : loops[b].edges) {
+                            clearance = std::min(clearance, le->distanceTo(mid));
                         }
-                        float reach = std::max(1e-4f, std::min(1e-2f * Kern::edgeLength(*piece), 0.4f * clearance));
-
-                        auto totalWinding = [&](Pos probe) {
-                            int w = 0;
-                            for (size_t b : mem) { w += loops[b].windingAround(probe); }
-                            return w;
-                        };
-                        bool leftIn  = totalWinding(mid + Kern::perpCCW(t) * reach) >= 1;
-                        bool rightIn = totalWinding(mid - Kern::perpCCW(t) * reach) >= 1;
-                        if (leftIn != rightIn) {
-                            piece->id = loops[a].id;   // provenance
-                            kept.push_back(std::move(piece));
-                        }
+                    }
+                    const float reach = std::max(1e-4f, std::min(1e-2f * Kern::edgeLength(*tp.e), 0.4f * clearance));
+                    int wl = 0, wr = 0;
+                    for (size_t b : mem) {
+                        wl += loops[b].windingAround(mid + Kern::perpCCW(t) * reach);
+                        wr += loops[b].windingAround(mid - Kern::perpCCW(t) * reach);
+                    }
+                    // doctrine keep: material strictly on the LEFT of travel
+                    if (wl >= 1 && wr < 1) {
+                        tp.e->id = loops[tp.loop].id;
+                        kept.push_back(std::move(tp.e));
                     }
                 }
             }
@@ -798,6 +1093,27 @@ export namespace Geo::Frontier {
                 out.push_back(std::move(stitched));
             }
         }
+
+        // Geometric-significance floor on the OUTPUT too: stitched cusp slivers
+        // (near-zero area, 2-3 edges) are noise the parity cull cannot judge
+        // (no handedness) and the next offsetValid would immortalize. See the
+        // input floor above.
+        std::erase_if(out, [](const Chain& m) {
+            return m.closed && std::fabs(m.signedArea()) < SignificanceAreaFloor;
+        });
+
+        // Geometric-significance floor: stitched cusp slivers are noise the
+        // parity cull cannot judge (no handedness) and the next offsetValid
+        // would immortalize (see SignificanceAreaFloor).
+        std::erase_if(out, [](const Chain& m) {
+            return m.closed && std::fabs(m.signedArea()) < SignificanceAreaFloor;
+        });
+
+        // The parity cull: enforce nesting alternation on the RESOLVED output.
+        // A frontier can never legitimately carry a ring nested inside a
+        // same-handed ring; any such survivor is a doubled bound or an artifact
+        // and corrupts every downstream winding. Cull, never reorient.
+        cullSameHandedNested(out);
         return out;
     }
 
@@ -845,6 +1161,27 @@ export namespace Geo::Frontier {
                 for (Chain& m : c.offsetValid(amount, eps)) { valid.push_back(std::move(m)); }
             }
             next.chains = Chain::merge(std::move(valid), eps);
+
+            // The cascade contract: NEGATIVE LOBES ALWAYS GET FILTERED. A
+            // negative (CW) chain is legitimate ONLY as a hole -- contained in a
+            // positive sibling (an annulus hole-family ring). A lone CW chain
+            // with no positive container bounds no material; un-filtered it
+            // cascades as a growing inverted ring and EMITS while positive
+            // geometry keeps its generation's sum positive. Per-chain judgment,
+            // not the generation sum.
+            std::erase_if(next.chains, [&next](const Chain& c) {
+                if (!c.closed) { return false; }
+                int h = c.handedness();
+                if (h == 0) { h = c.turningSign(); }
+                if (h >= 0) { return false; }
+                for (const Chain& b : next.chains) {
+                    if (&b == &c || !b.closed) { continue; }
+                    int hb = b.handedness();
+                    if (hb == 0) { hb = b.turningSign(); }
+                    if (hb > 0 && Chain::containedIn(c, b)) { return false; }   // a real hole
+                }
+                return true;                                                    // lone inverted: garbage
+            });
             return next;
         }
     };
@@ -1176,25 +1513,45 @@ export namespace Geo::Frontier {
         // zero-area loops are dropped with a warning.
         void orientByParity(std::vector<Chain>& loops, int base, Role role) {
 
-            std::vector<Chain> kept;
-            for (size_t a = 0; a < loops.size(); a++) {
+            // DECIDE FIRST, MOVE SECOND. The old single pass std::moved each
+            // processed loop into `kept`, so every b < a was a hollow husk during
+            // a's containment test -- depth silently read 0 whenever a container
+            // happened to sort before its contained loop. Assembly order is
+            // arbitrary and mirror-dependent, which made this the one-sided
+            // island bug: same feature, opposite faces, opposite verdicts.
+            const size_t n = loops.size();
+            std::vector<int> cur(n, 0);
+            std::vector<int> desired(n, 0);
 
+            for (size_t a = 0; a < n; a++) {
                 float area = loops[a].signedArea();
-                int cur = (area > 1e-4f) ? 1 : (area < -1e-4f ? -1 : 0);
-                if (cur == 0) {
+                cur[a] = (area > 1e-4f) ? 1 : (area < -1e-4f ? -1 : 0);
+                if (cur[a] == 0) { continue; }
+
+                int depth = 0;
+                for (size_t b = 0; b < n; b++) {
+                    if (b == a) { continue; }
+                    if (Chain::containedIn(loops[a], loops[b])) { depth++; }
+                }
+                desired[a] = ((depth % 2) == 0) ? base : -base;
+
+                {   // orientation confession: names WHY a loop kept/flipped its sense
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                        "[orientByParity] loop #%zu area %+.2f depth %d desired %+d%s",
+                        a, static_cast<double>(area), depth, desired[a],
+                        (cur[a] == desired[a]) ? "" : " FLIP");
+                    warnings.push_back(buf);
+                }
+            }
+
+            std::vector<Chain> kept;
+            for (size_t a = 0; a < n; a++) {
+                if (cur[a] == 0) {
                     warnings.push_back("A degenerate (zero-area) input loop was dropped.");
                     continue;
                 }
-
-                int depth = 0;
-                Pos probe = Chain::maxXPoint(loops[a]);
-                for (size_t b = 0; b < loops.size(); b++) {
-                    if (b == a) { continue; }
-                    if (loops[b].windingAround(probe) != 0) { depth++; }
-                }
-
-                int desired = ((depth % 2) == 0) ? base : -base;
-                Chain c = (cur == desired) ? std::move(loops[a]) : loops[a].reversed();
+                Chain c = (cur[a] == desired[a]) ? std::move(loops[a]) : loops[a].reversed();
                 c.role = role;
                 kept.push_back(std::move(c));
             }
@@ -1240,20 +1597,34 @@ export namespace Geo::Frontier {
             std::vector<Chain> avoids = avoidPreOriented ? std::move(avoidLoops)
                                                          : Chain::assemble(avoid, aEps);
 
-            // Weld almost-closed loops shut: section endpoints carry slop past
-            // the assembly eps, and a loop that is closed in fact but open by a
-            // hair must not be dropped at the door. The gap is bridged with a
-            // real segment (a marked-closed loop with a geometric hole would
-            // break the crossing walk's coincidence matching downstream).
+            // HARD-weld almost-closed loops shut: section endpoints carry slop
+            // past the assembly eps, and a loop that is closed in fact but open
+            // by a hair must not be dropped at the door. Closure is enforced by
+            // SNAPPING both ends to their mean -- never a micro bridge segment
+            // (a sub-eps edge is invisible to crossing detection). Then every
+            // INTERIOR joint is snapped exact too: assemble connects within eps,
+            // so a "closed" chain still carries up-to-eps slop at every vertex
+            // until Chain::hardWeld runs.
             auto weld = [&](std::vector<Chain>& v, float sysEps) {
                 const float gapEps = std::max(params.weldEps, sysEps);   // a loop's own residual
                 for (Chain& c : v) {                                     // gap scales with its solid
-                    if (c.closed || c.edges.empty()) { continue; }
-                    Pos a = Kern::eEnd(*c.edges.back());
-                    Pos b = Kern::eStart(*c.edges.front());
-                    if ((b - a).pythag() > gapEps) { continue; }
-                    if ((b - a).pythag() > 1e-6f) { c.edges.push_back(std::make_unique<Segment2>(a, b)); }
-                    c.closed = true;
+                    if (c.edges.empty()) { continue; }
+                    if (!c.closed) {
+                        const Pos a = Kern::eEnd(*c.edges.back());
+                        const Pos b = Kern::eStart(*c.edges.front());
+                        const float gap = (b - a).pythag();
+                        if (gap > gapEps) { continue; }
+                        if (gap > 1e-9f) {
+                            const Pos mid = (a + b) * 0.5f;
+                            if (!Kern::setEdgeEnd(*c.edges.back(), mid)
+                                || !Kern::setEdgeStart(*c.edges.front(), mid)) {
+                                c.edges.push_back(std::make_unique<Segment2>(
+                                    Kern::eEnd(*c.edges.back()), Kern::eStart(*c.edges.front())));
+                            }
+                        }
+                        c.closed = true;
+                    }
+                    Chain::hardWeld(c, gapEps);
                 }
             };
             weld(fills, fEps);
@@ -1300,19 +1671,41 @@ export namespace Geo::Frontier {
             // sign per system (Method/06). The fill takes the extra fillBias
             // (see Params): reach is claimed greedily, the safety bound stays
             // exact, and grown boundaries never sit coincident.
+            // A SHRINKING chain (fill outer, avoid island -- positive signed area in
+            // its system's parity) may legitimately collapse under the tool radius.
+            // A DILATING chain (fill hole, avoid outer -- negative signed area) grows
+            // the region: its offset can NEVER legitimately vanish, so an empty
+            // offsetValid there is a kernel failure -- and swallowing it silently
+            // drops a hard bound from the merge (an island vanishes from the seed,
+            // the cascade runs outer-only, and only the independently-built clip
+            // stands between the rings and the kept material). Loud + refusing.
             std::vector<Chain> grown;
-            for (Chain& c : fills) {
-                for (Chain& m : c.offsetValid(-(params.seedOffset * R + params.fillBias), params.eps)) {
-                    grownFill.push_back(m.clone());     // preserved: the merge consumes its input
+            bool lostBound = false;
+            auto growInto = [&](Chain& c, float amount, std::vector<Chain>& keep,
+                                const char* system) {
+                std::vector<Chain> off = c.offsetValid(amount, params.eps);
+                if (off.empty() && c.signedArea() < 0.0f) {
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                        "%s bound failed to offset (dilating side, %zu edge(s)) -- "
+                        "seed would lose a hard bound; level refused",
+                        system, c.edges.size());
+                    warnings.push_back(buf);
+                    lostBound = true;
+                    return;
+                }
+                for (Chain& m : off) {
+                    keep.push_back(m.clone());          // preserved: the merge consumes its input
                     grown.push_back(std::move(m));
                 }
+            };
+            for (Chain& c : fills) {
+                growInto(c, -(params.seedOffset * R + params.fillBias), grownFill, "fill");
             }
             for (Chain& c : avoids) {
-                for (Chain& m : c.offsetValid(+R, params.eps)) {
-                    grownAvoid.push_back(m.clone());
-                    grown.push_back(std::move(m));
-                }
+                growInto(c, +R, grownAvoid, "avoid");
             }
+            if (lostBound) { return false; }
 
             // The sections have served the growth; keep them as the consumer's
             // oracles (fillBoundary: material vs air; avoidBoundary: what bounded).
@@ -1335,6 +1728,50 @@ export namespace Geo::Frontier {
                 warnings.push_back("No seed: the avoid region leaves no reachable extent of the fill "
                                    "(or the fill collapsed under the tool radius).");
                 return false;
+            }
+
+            // 4b. Merge validation, path-independent: the interior of every DILATING
+            // bound (fill hole, avoid outer -- the hard keep-outs) must read OUTSIDE
+            // the merged seed, whichever merge path (crossing walk / containment
+            // clustering) handled it. A large island whose grown ring INTERSECTS the
+            // fat-inset outer takes the crossing walk; if the merge loses it there,
+            // the cascade runs outer-only over kept material with just the clip
+            // standing in the way. Probe: nudge inward of the ring's max-X vertex
+            // (interior of any simple loop lies -X of its rightmost point), verified
+            // against the ring's own winding before it may condemn the seed.
+            {
+                auto retainsInterior = [&](const Chain& c) -> bool {
+                    if (!c.closed || c.edges.empty() || c.signedArea() >= 0.0f) { return false; }
+                    Pos mx = Kern::eStart(*c.edges.front());
+                    for (const auto& e : c.edges) {
+                        const Pos a = Kern::eStart(*e);
+                        const Pos b = Kern::eEnd(*e);
+                        if (a.x > mx.x) { mx = a; }
+                        if (b.x > mx.x) { mx = b; }
+                    }
+                    for (float nudge : { 0.02f * R, 0.1f * R, 0.5f * R }) {
+                        const Pos probe{ mx.x - nudge, mx.y };
+                        if (c.windingAround(probe) == 0) { continue; }   // not interior; try deeper
+                        int w = 0;
+                        for (const Chain& s : seed.chains) { w += s.windingAround(probe); }
+                        return w >= 1;                                    // kept-material interior inside the seed
+                    }
+                    return false;
+                };
+                for (const Chain& c : grownAvoid) {
+                    if (retainsInterior(c)) {
+                        warnings.push_back("Seed retains an avoid bound's interior -- the merge lost "
+                                           "an intersecting island ring; level refused.");
+                        return false;
+                    }
+                }
+                for (const Chain& c : grownFill) {
+                    if (retainsInterior(c)) {
+                        warnings.push_back("Seed retains a fill hole's interior -- the merge lost an "
+                                           "intersecting hole ring; level refused.");
+                        return false;
+                    }
+                }
             }
 
             // The extended region: the identical construction from the same
