@@ -1679,17 +1679,35 @@ export namespace Geo::Frontier {
             // drops a hard bound from the merge (an island vanishes from the seed,
             // the cascade runs outer-only, and only the independently-built clip
             // stands between the rings and the kept material). Loud + refusing.
+            // Exception: a chain under SignificanceAreaFloor bounds no region and
+            // offsetValid refuses it BY DESIGN -- its empty offset is the promised
+            // outcome, not a lost bound. Refusing the level on one is a false
+            // alarm on merge noise (a cusp sliver is not a hard bound).
             std::vector<Chain> grown;
             bool lostBound = false;
             auto growInto = [&](Chain& c, float amount, std::vector<Chain>& keep,
                                 const char* system) {
                 std::vector<Chain> off = c.offsetValid(amount, params.eps);
+                if (off.empty() && !c.closed) {
+                    // an open chain bounds nothing and its signedArea is
+                    // meaningless -- it must not read as a dilating bound. On the
+                    // pre-oriented path this is a caller contract breach: loud.
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                        "%s OPEN chain reached growth (%zu edge(s)) -- "
+                        "contract breach upstream; dropped", system, c.edges.size());
+                    warnings.push_back(buf);
+                    return;
+                }
+                if (off.empty() && std::fabs(c.signedArea()) < Chain::SignificanceAreaFloor) {
+                    return;   // sub-floor noise: unoffsettable by definition, drop
+                }
                 if (off.empty() && c.signedArea() < 0.0f) {
                     char buf[160];
                     std::snprintf(buf, sizeof(buf),
-                        "%s bound failed to offset (dilating side, %zu edge(s)) -- "
-                        "seed would lose a hard bound; level refused",
-                        system, c.edges.size());
+                        "%s bound failed to offset (dilating side, %zu edge(s), "
+                        "area %+.4f) -- seed would lose a hard bound; level refused",
+                        system, c.edges.size(), static_cast<double>(c.signedArea()));
                     warnings.push_back(buf);
                     lostBound = true;
                     return;
