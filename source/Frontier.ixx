@@ -8,6 +8,7 @@ module;
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
+#include <type_traits>
 
 export module Geo.Frontier;
 
@@ -1437,6 +1438,8 @@ export namespace Geo::Frontier {
         std::vector<Pos> linkEnd;   // inbound landing / this ring's lap entry
         std::vector<Geo::Chain> cycle;   // full cyclic view seated at linkEnd
         std::vector<Geo::Chain> lap;     // directed traversal linkEnd -> linkStart
+        std::vector<Geo::Chain> linkSpan; // omitted directed window linkStart -> linkEnd
+        std::vector<Geo::Chain> linkPath; // morph from this start -> next end
         std::vector<Geo::Chain> overlap;
         std::vector<char> linkToNext;    // exact projected stay-down link exists
     };
@@ -1667,6 +1670,37 @@ export namespace Geo::Frontier {
             }
         }
         Geo::Chain::hardWeld(out, 1e-3f);
+        return out;
+    }
+
+    // Morph between corresponding directed path positions. Smoothstep makes the
+    // transition source-dominated at departure and target-dominated at arrival;
+    // normalized arclength keeps unlike edge layouts synchronized.
+    inline Geo::Chain morphLink(const Geo::Chain& sourceSpan,
+                                const Geo::Chain& targetSpan,
+                                float toolRadius) {
+        Geo::Chain out;
+        const float sourceLength = ringLength(sourceSpan);
+        const float targetLength = ringLength(targetSpan);
+        if (sourceSpan.edges.empty() || targetSpan.edges.empty()
+            || sourceLength <= 1e-6f || targetLength <= 1e-6f) { return out; }
+
+        const float course = std::max(sourceLength, targetLength);
+        const float cadence = std::max(0.125f * toolRadius, 1e-3f);
+        const int count = std::max(4, static_cast<int>(std::ceil(course / cadence)));
+        Pos previous = sourceSpan.pointAtDistance(0.0f);
+        for (int i = 1; i <= count; i++) {
+            const float u = static_cast<float>(i) / static_cast<float>(count);
+            const float blend = u * u * (3.0f - 2.0f * u);
+            const Pos a = sourceSpan.pointAtDistance(u * sourceLength);
+            const Pos b = targetSpan.pointAtDistance(u * targetLength);
+            const Pos point = a * (1.0f - blend) + b * blend;
+            if ((point - previous).pythag() > 1e-7f) {
+                out.edges.push_back(std::make_unique<Segment2>(previous, point));
+            }
+            previous = point;
+        }
+        Geo::Chain::hardWeld(out, 1e-4f);
         return out;
     }
 
@@ -1948,7 +1982,8 @@ export namespace Geo::Frontier {
         plan.linkCenterDistance.resize(n); plan.linkStartDistance.resize(n); plan.linkEndDistance.resize(n);
         plan.linkCenter.resize(n);
         plan.linkStart.resize(n); plan.linkEnd.resize(n);
-        plan.cycle.resize(n); plan.lap.resize(n); plan.overlap.resize(n);
+        plan.cycle.resize(n); plan.lap.resize(n);
+        plan.linkSpan.resize(n); plan.linkPath.resize(n); plan.overlap.resize(n);
 
         std::vector<size_t> depth(n, 0);
         for (size_t i = 0; i < n; i++) {
@@ -2102,7 +2137,78 @@ export namespace Geo::Frontier {
             plan.linkEnd[i] = rings[i].pointAtDistance(plan.linkEndDistance[i]);
             plan.cycle[i] = rings[i].startedAtDistance(plan.linkEndDistance[i]);
             plan.lap[i] = ringPrefix(plan.cycle[i], lengths[i] - separation);
+            Geo::Chain atStart = rings[i].startedAtDistance(plan.linkStartDistance[i]);
+            plan.linkSpan[i] = ringPrefix(atStart, separation);
             plan.overlap[i] = {};
+        }
+
+        // Choose sibling order by the morph that will actually touch the parent.
+        // A child-first subtree finishes at its immediate child root, so the best
+        // child belongs LAST; parent-first uses the same relation in reverse and
+        // puts the best child FIRST. Subtrees remain indivisible units.
+        auto morphCost = [&](size_t child, size_t parent) {
+            Geo::Chain path = parentFirst
+                ? morphLink(plan.linkSpan[parent], plan.linkSpan[child], toolRadius)
+                : morphLink(plan.linkSpan[child], plan.linkSpan[parent], toolRadius);
+            std::vector<Pos> points;
+            path.tessellateDirected(points);
+            if (points.size() < 2) { return 1e30f; }
+            float length = 0.0f, turning = 0.0f;
+            for (size_t i = 1; i < points.size(); i++) {
+                length += (points[i] - points[i - 1]).pythag();
+            }
+            for (size_t i = 1; i + 1 < points.size(); i++) {
+                const Pos a = (points[i] - points[i - 1]).normalized();
+                const Pos b = (points[i + 1] - points[i]).normalized();
+                turning += std::fabs(std::atan2(a.x * b.y - a.y * b.x,
+                                                a.x * b.x + a.y * b.y));
+            }
+            return length + toolRadius * turning;
+        };
+
+        std::vector<std::vector<size_t>> preferredChildren(n);
+        std::vector<size_t> preferredRoots;
+        for (size_t i = 0; i < n; i++) {
+            if (plan.parent[i] >= 0) {
+                preferredChildren[static_cast<size_t>(plan.parent[i])].push_back(i);
+            }
+            else { preferredRoots.push_back(i); }
+        }
+        for (size_t parent = 0; parent < n; parent++) {
+            auto& siblings = preferredChildren[parent];
+            std::stable_sort(siblings.begin(), siblings.end(), [&](size_t a, size_t b) {
+                const float ca = morphCost(a, parent), cb = morphCost(b, parent);
+                return parentFirst ? ca < cb : ca > cb;
+            });
+        }
+
+        std::vector<size_t> preferredOrder;
+        auto preferredVisit = [&](auto&& self, size_t node) -> void {
+            if (parentFirst) { preferredOrder.push_back(node); }
+            for (size_t child : preferredChildren[node]) { self(self, child); }
+            if (!parentFirst) { preferredOrder.push_back(node); }
+        };
+        for (size_t root : preferredRoots) { preferredVisit(preferredVisit, root); }
+
+        if (preferredOrder.size() == n) {
+            std::vector<size_t> newIndex(n);
+            for (size_t i = 0; i < n; i++) { newIndex[preferredOrder[i]] = i; }
+            const std::vector<int> oldParent = plan.parent;
+            auto permute = [&](auto& values) {
+                using Values = std::decay_t<decltype(values)>;
+                Values reordered;
+                reordered.reserve(values.size());
+                for (size_t old : preferredOrder) { reordered.push_back(std::move(values[old])); }
+                values = std::move(reordered);
+            };
+            permute(rings); permute(wall); permute(flip);
+            permute(plan.linkCenterDistance); permute(plan.linkStartDistance); permute(plan.linkEndDistance);
+            permute(plan.linkCenter); permute(plan.linkStart); permute(plan.linkEnd);
+            permute(plan.cycle); permute(plan.lap); permute(plan.linkSpan); permute(plan.linkPath); permute(plan.overlap);
+            plan.parent.assign(n, -1);
+            for (size_t old = 0; old < n; old++) if (oldParent[old] >= 0) {
+                plan.parent[newIndex[old]] = static_cast<int>(newIndex[static_cast<size_t>(oldParent[old])]);
+            }
         }
 
         // Preserve the established march order. The caller has already applied
@@ -2150,6 +2256,8 @@ export namespace Geo::Frontier {
             const bool toParent = plan.parent[current] == static_cast<int>(next);
             const bool toChild = plan.parent[next] == static_cast<int>(current);
             if ((!toParent && !toChild) || rings[current].edges.empty() || rings[next].edges.empty()) { continue; }
+            plan.linkPath[current] = morphLink(
+                plan.linkSpan[current], plan.linkSpan[next], toolRadius);
             plan.linkToNext[current] = 1;
         }
 
