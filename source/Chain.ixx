@@ -1360,6 +1360,49 @@ export namespace Geo {
             return out;
         }
 
+        // A stable geometric location on a chain is directed arclength, not an
+        // edge index. Re-seating and splitting may change edge layout while the
+        // path coordinate remains meaningful. Edge resolution is deliberately
+        // transient and confined to this exact chain instance.
+        Pos pointAtDistance(float distance) const {
+            if (edges.empty()) { return {}; }
+            float total = 0.0f;
+            for (const auto& e : edges) { total += edgeLength(*e); }
+            if (total <= 1e-6f) { return eStart(*edges.front()); }
+            if (closed) {
+                distance = std::fmod(distance, total);
+                if (distance < 0.0f) { distance += total; }
+            }
+            else { distance = std::clamp(distance, 0.0f, total); }
+            for (const auto& e : edges) {
+                const float length = edgeLength(*e);
+                if (distance <= length) {
+                    return edgePointAt(*e, length > 1e-6f ? distance / length : 0.0f);
+                }
+                distance -= length;
+            }
+            return eEnd(*edges.back());
+        }
+
+        Chain startedAtDistance(float distance, float eps = 1e-4f) const {
+            if (!closed || edges.empty()) { return clone(); }
+            float total = 0.0f;
+            for (const auto& e : edges) { total += edgeLength(*e); }
+            if (total <= 1e-6f) { return clone(); }
+            distance = std::fmod(distance, total);
+            if (distance < 0.0f) { distance += total; }
+            for (size_t i = 0; i < edges.size(); i++) {
+                const float length = edgeLength(*edges[i]);
+                if (distance <= length) {
+                    const Pos point = edgePointAt(*edges[i],
+                        length > 1e-6f ? distance / length : 0.0f);
+                    return startedAt(i, point, eps);
+                }
+                distance -= length;
+            }
+            return clone();
+        }
+
         // Open-air pre-offset: every edge marked openAir is OFFSET `amount` into
         // the free region -- each alone, as a single independent edge, the true
         // parallel curve of itself (not a rigid translation picked at one sample
@@ -1532,6 +1575,44 @@ export namespace Geo {
         // Building
         //--------------------------------------------------
 
+        // Make every join that was accepted within `eps` EXACT.  Chain assembly
+        // consumes an unordered edge pool by proximity; leaving that proximity
+        // slop in the result is poisonous to every later topological operation
+        // (winding, clipping and hierarchy casts all expect a real shared vertex).
+        // Mutate both neighbours to their mean when their curve representation can
+        // absorb the endpoint.  The rare representation that cannot is joined by
+        // one explicit segment, never by an implicit gap.
+        static void hardWeld(Chain& c, float eps) {
+            const size_t n = c.edges.size();
+            if (n == 0) { return; }
+            const size_t joints = c.closed ? n : n - 1;
+            std::vector<size_t> bridgeAfter;
+            for (size_t k = 0; k < joints; k++) {
+                Stoicheion& aEdge = *c.edges[k];
+                Stoicheion& bEdge = *c.edges[(k + 1) % n];
+                const Pos a = eEnd(aEdge);
+                const Pos b = eStart(bEdge);
+                const float gap = (b - a).pythag();
+                if (gap <= 1e-9f || gap > eps) { continue; }
+                const Pos joint = (a + b) * 0.5f;
+                const bool aOk = setEdgeEnd(aEdge, joint);
+                const bool bOk = setEdgeStart(bEdge, joint);
+                if (!aOk || !bOk) { bridgeAfter.push_back(k); }
+            }
+            // Insert backwards so the recorded indices continue to name the
+            // original consumed edges.
+            for (size_t i = bridgeAfter.size(); i-- > 0; ) {
+                const size_t k = bridgeAfter[i];
+                const Pos a = eEnd(*c.edges[k]);
+                const size_t next = (k + 1) % n;
+                const Pos b = eStart(*c.edges[next]);
+                if ((b - a).pythag() > 1e-9f) {
+                    c.edges.insert(c.edges.begin() + static_cast<std::ptrdiff_t>(k + 1),
+                                   std::make_unique<Segment2>(a, b));
+                }
+            }
+        }
+
         // Grow one chain out of the remaining edge pool, connecting end-to-start
         // until it closes or runs out of neighbours. `allowReverse` permits
         // flipping an edge to make a connection -- legitimate when chaining a
@@ -1562,6 +1643,9 @@ export namespace Geo {
                 c.edges.push_back(std::move(next));
                 if ((eEnd(*c.edges.back()) - loopStart).pythag() <= eps) { c.closed = true; break; }
             }
+            // `pool` ownership has now been consumed into `c`; publish a chain
+            // with exact joints, not merely a sequence whose endpoints are near.
+            hardWeld(c, eps);
             return c;
         }
 
