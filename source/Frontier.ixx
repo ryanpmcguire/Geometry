@@ -1442,6 +1442,10 @@ export namespace Geo::Frontier {
         std::vector<Geo::Chain> linkPath; // morph from this start -> next end
         std::vector<Geo::Chain> overlap;
         std::vector<char> linkToNext;    // exact projected stay-down link exists
+        // A closed root with no outgoing lineage link has no consumer for its
+        // omitted link window. Motion emission must therefore traverse the whole
+        // cycle and finish back at linkEnd, rather than stopping at linkStart.
+        std::vector<char> terminalRoot;
     };
 
     inline bool inside(const std::vector<Geo::Chain>& region, Pos p) {
@@ -2259,6 +2263,13 @@ export namespace Geo::Frontier {
             plan.linkPath[current] = morphLink(
                 plan.linkSpan[current], plan.linkSpan[next], toolRadius);
             plan.linkToNext[current] = 1;
+        }
+
+        plan.terminalRoot.assign(rings.size(), 0);
+        for (size_t i = 0; i < rings.size(); i++) {
+            plan.terminalRoot[i] = plan.parent[i] < 0
+                && rings[i].closed
+                && plan.linkToNext[i] == 0;
         }
 
         // Bind metadata to the exact operands Strategy will emit.
